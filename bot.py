@@ -163,32 +163,21 @@ async def day_schedule(message: Message):
     await message.answer(response, parse_mode="Markdown", disable_web_page_preview=True)
 
 # Обработка "На сегодня" / "На завтра"
-@dp.message(F.text.in_(["📅 На сегодня", "📅 На завтра", "Расписание на сегодня", "Расписание на завтра"]))
-async def today_tomorrow_schedule(message: Message):
-    days_map = {
-        0: "Понеділок",
-        1: "Вівторок",
-        2: "Середа",
-        3: "Четвер",
-        4: "П'ятниця",
-        5: "Субота",
-        6: "Неділя"
-    }
+@dp.message(F.text.in_(["🟢 Понеділок", "🟢 Вівторок", "🟢 Середа", "🟢 Четвер", "🟢 П'ятниця"]))
+async def day_schedule(message: Message):
+    day_map_num = {"Понеділок": 0, "Вівторок": 1, "Середа": 2, "Четвер": 3, "П'ятниця": 4}
+    day_name = message.text.replace("🟢 ", "")
     
     now = datetime.now()
-    target_date = now
+    current_weekday = now.weekday()
+    target_weekday = day_map_num[day_name]
     
-    if "завтра" in message.text.lower():
-        target_date = now + timedelta(days=1)
+    days_ahead = target_weekday - current_weekday
+    if days_ahead < 0:  # Если день на этой неделе уже прошел, переносим на следующую
+        days_ahead += 7
         
-    weekday = target_date.weekday()
-    day_name = days_map.get(weekday)
-    
-    if day_name in SCHEDULE:
-        response = send_schedule_for_day(day_name, target_date)
-    else:
-        response = f"📅 Сьогодні/завтра (**{day_name}**) — вихідний день, пар немає! 🎉"
-        
+    target_date = now + timedelta(days=days_ahead)
+    response = send_schedule_for_day(day_name, target_date)
     await message.answer(response, parse_mode="Markdown", disable_web_page_preview=True)
 
 @dp.message(F.text == "🔗 Всі посилання на Zoom")
