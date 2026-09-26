@@ -1,20 +1,36 @@
 import asyncio
+import csv
+import io
 import logging
+import os
+import re
 from datetime import datetime, timedelta
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import requests
-from bs4 import BeautifulSoup
 from aiohttp import web
 
-TOKEN = "8479473750:AAE3OtfpM0Q6NEH_x4Zu8nPXuH5aFC0Gfbo"
+# Токен теперь берётся из переменной окружения BOT_TOKEN (задаётся в Render,
+# в Environment → Environment Variables). В коде и на GitHub его быть не должно.
+TOKEN = os.environ["BOT_TOKEN"]
+
+GROUP_NAME = "А-22"
+
+# ID таблицы замен (кусок ссылки между /d/e/ и /pubhtml)
+SUBSTITUTIONS_SHEET_ID = "2PACX-1vQlLOazl1JOcO5xS1-Ryan5BF2lve26w7lRG-hQTk3J48S8uwm8UtvWJmteeCyqVUtxqJVN7RHUc1I-"
+SUBSTITUTIONS_CSV_URL = (
+    f"https://docs.google.com/spreadsheets/d/e/{SUBSTITUTIONS_SHEET_ID}/pub?gid=0&single=true&output=csv"
+)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-REPLACEMENTS = {}
+# REPLACEMENTS[date_str][pair_number] = (_, subject, zoom_link)
+# date_str в формате "%d.%m.%Y", как в send_schedule_for_day
+REPLACEMENTS: dict[str, dict[int, tuple]] = {}
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -70,6 +86,31 @@ SCHEDULE = {
     ]
 }
 
+# Ключ — заметная часть названия предмета в нижнем регистре, значение — ссылка.
+# Используется, чтобы подставить Zoom-ссылку к предмету, пришедшему из таблицы замен
+# (там нет ссылок, только название предмета и преподаватель).
+ZOOM_BY_SUBJECT = {
+    "квіт": "https://us05web.zoom.us/j/9856624171?pwd=vdxkCpVL6bpNo514BbcLE7iKNWLsGK.1",  # квітництво / квітникарство
+    "фізр": "https://us04web.zoom.us/j/5318097982?pwd=aK3pQZ6y4arwePmfQlUIXpUQWPndkb.1",
+    "грунтознав": "https://us02web.zoom.us/j/3188320656?pwd=QWgycFc4S2JjUXk5ZDhoNnhrYjljdz09&omn=82972358550",
+    "право": "https://us05web.zoom.us/j/7399873325?pwd=SVFFQUsrK3dpSTZ5NHlOWTJPZ2cxQT09",
+    "еколог": "https://us02web.zoom.us/j/8467559257?pwd=emE1NzZuS0RiV0tOODN6OTFtU0twUT09",
+    "інформатик": "https://us02web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09",
+    "креслен": "https://us04web.zoom.us/j/74812602094?pwd=LtakeMi2lnjEbJZVqbnt2mbyXUhaxJ.1",
+    "історі": "https://us02web.zoom.us/j/9790221936?omn=71559763873",
+    "ботаніка": "https://us04web.zoom.us/j/75480487895?pwd=REZ04jdCCFGTu8srgqa1vFOXCaaPzo.1",
+    "англійськ": "https://us04web.zoom.us/j/4492224328?pwd=Q21OQjBQdUxWejRMczBRczQ1c0ZSdz09",
+}
+
+def find_zoom_for_subject(subject: str) -> str | None:
+    if not subject:
+        return None
+    low = subject.lower()
+    for key, link in ZOOM_BY_SUBJECT.items():
+        if key in low:
+            return link
+    return None
+
 ZOOM_ALL = (
     "🔗 **Всі посилання на Zoom (А-22):**\n\n"
     "• **Квітівництво** (Жупіньська): [Посилання](https://us05web.zoom.us/j/9856624171?pwd=vdxkCpVL6bpNo514BbcLE7iKNWLsGK.1)\n"
@@ -84,15 +125,103 @@ ZOOM_ALL = (
     "• **Англійська мова** (Камишнікова): [Посилання](https://us04web.zoom.us/j/4492224328?pwd=Q21OQjBQdUxWejRMczBRczQ1c0ZSdz09)"
 )
 
+
+def _normalize_group(name: str) -> str:
+    """"А-22", "А - 22", "A-22" и т.п. должны считаться одной и той же группой
+    (в т.ч. Латинская A и Кириллическая А, они визуально неотличимы)."""
+    return name.replace(" ", "").replace("–", "-").upper().replace("A", "А")
+
+
+def _find_announcement_date(rows: list[list[str]]):
+    """Ищет дату вида 28.09.2026 в первых строках таблицы (обычно в заголовке)."""
+    for row in rows[:5]:
+        for cell in row:
+            m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", cell)
+            if m:
+                day, month, year = map(int, m.groups())
+                try:
+                    return datetime(year, month, day)
+                except ValueError:
+                    continue
+    return None
+
+
+def _extract_group_rows(rows: list[list[str]], group_name: str) -> list[dict]:
+    """Достаёт строки замен для группы, поддерживая "склеенные" ячейки —
+    название группы указано только в первой строке блока, дальше пусто."""
+    result = []
+    current_group = None
+    target = _normalize_group(group_name)
+
+    for row in rows:
+        cells = [c.strip() for c in row]
+        if not any(cells) or len(cells) < 3:
+            continue
+
+        group_cell, pair_cell, subject_cell = cells[0], cells[1], cells[2]
+        teacher_cell = cells[4] if len(cells) > 4 else ""
+
+        if group_cell:
+            current_group = group_cell
+
+        if not current_group or _normalize_group(current_group) != target or not pair_cell:
+            continue
+
+        result.append({"pair": pair_cell, "subject": subject_cell, "teacher": teacher_cell})
+
+    return result
+
+
+def _fetch_replacements_sync():
+    """Синхронная (блокирующая) часть — запускается в отдельном потоке,
+    чтобы не подвешивать бота во время сетевого запроса."""
+    response = requests.get(SUBSTITUTIONS_CSV_URL, timeout=15)
+    response.raise_for_status()
+    text = response.content.decode("utf-8-sig", errors="replace")
+    rows = list(csv.reader(io.StringIO(text)))
+
+    announced_date = _find_announcement_date(rows)
+    if not announced_date:
+        return None, []
+
+    return announced_date, _extract_group_rows(rows, GROUP_NAME)
+
+
 async def fetch_replacements():
-    url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQlLOazl1JOcO5xS1-Ryan5BF2lve26w7lRG-hQTk3J48S8uwm8UtvWJmteeCyqVUtxqJVN7RHUc1I-/pubhtml?gid=0&single=true"
+    """Скачивает таблицу замен и, если объявление на сегодня или завтра,
+    кладёт разобранные замены в REPLACEMENTS."""
     try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            print("🔄 Автоматическая проверка замен с Google Таблицы выполнена успешно.")
+        announced_date, group_rows = await asyncio.to_thread(_fetch_replacements_sync)
     except Exception as e:
         print(f"Ошибка при загрузке замен: {e}")
+        return
+
+    if not announced_date:
+        print("🔄 Проверка замен: дата объявления не найдена (или замен пока нет).")
+        return
+
+    date_str = announced_date.strftime("%d.%m.%Y")
+
+    if not group_rows:
+        print(f"🔄 Проверка замен на {date_str}: для {GROUP_NAME} замен нет.")
+        return
+
+    day_map: dict[int, tuple] = {}
+    for row in group_rows:
+        subject = row["subject"] or "Вільна"
+        teacher = row["teacher"]
+        full_subject = f"{subject} — {teacher}" if teacher and "Вільн" not in subject else subject
+        link = find_zoom_for_subject(subject)
+
+        # "3,4" -> применяем и к 3-й, и к 4-й паре
+        for part in row["pair"].split(","):
+            part = part.strip()
+            if part.isdigit():
+                day_map[int(part)] = (None, full_subject, link)
+
+    REPLACEMENTS[date_str] = day_map
+    print(f"🔄 Замены на {date_str} обновлены для {GROUP_NAME}: {day_map}")
+
 
 def send_schedule_for_day(day_name, target_date):
     lessons = SCHEDULE.get(day_name)
@@ -116,7 +245,7 @@ def send_schedule_for_day(day_name, target_date):
                 else:
                     subject = lines[1].replace("Під рискою: ", "🎯 ")
                 
-        if link and "Вільно" not in subject:
+        if link and "Вільно" not in subject and "Вільна" not in subject:
             response += f"🔹 **{time_slot}**\n   {subject}\n   🔗 [Підключитися до Zoom]({link})\n\n"
         else:
             response += f"🔹 **{time_slot}**\n   {subject}\n\n"
@@ -176,7 +305,23 @@ async def all_zoom(message: Message):
 
 @dp.message(F.text.in_(["🔄 Замены", "Замены"]))
 async def replacements_info(message: Message):
-    await message.answer("🔄 Бот автоматично перевіряє офіційні заміни на поточні дати та коригує розклад.", parse_mode="Markdown")
+    await message.answer("🔄 Перевіряю офіційні заміни...")
+    await fetch_replacements()
+
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+
+    parts = []
+    for label, date_str in (("на сьогодні", today_str), ("на завтра", tomorrow_str)):
+        day_reps = REPLACEMENTS.get(date_str)
+        if day_reps:
+            lines = "\n".join(f"  {pair} пара: {info[1]}" for pair, info in sorted(day_reps.items()))
+            parts.append(f"**Заміни {label} ({date_str}):**\n{lines}")
+
+    if parts:
+        await message.answer("\n\n".join(parts), parse_mode="Markdown")
+    else:
+        await message.answer("Замін на сьогодні/завтра немає — діє звичайний розклад ✅")
 
 async def handle(request):
     return web.Response(text="Bot is running!")
@@ -186,7 +331,8 @@ async def web_server():
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
 async def main():
