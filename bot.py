@@ -7,7 +7,7 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import requests
 from bs4 import BeautifulSoup
-from aiohttp import web  # веб-сервер для ответа Render
+from aiohttp import web
 
 TOKEN = "8479473750:AAEq-Sdc5krdwvwIrqxUjeJQ0shOBdU1P3A"
 
@@ -79,7 +79,7 @@ ZOOM_ALL = (
     "• **Екологія** (Батіг): [Посилання](https://us02web.zoom.us/j/8467559257?pwd=emE1NzZuS0RiV0tOODN6OTFtU0twUT09)\n"
     "• **Інформатика** (Бембель): [Посилання](https://us07web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09)\n"
     "• **Креслення** (Переходович): [Посилання](https://us04web.zoom.us/j/74812602094?pwd=LtakeMi2lnjEbJZVqbnt2mbyXUhaxJ.1)\n"
-    "• **Історія** (Орел): [Посилання](https://us04web.zoom.us/j/9790221936?omn=71559763873)\n"
+    "• **Історія** (Орел): [Посилання](https://us02web.zoom.us/j/9790221936?omn=71559763873)\n"
     "• **Ботаніка** (Сеніна): [Посилання](https://us04web.zoom.us/j/75480487895?pwd=REZ04jdCCFGTu8srgqa1vFOXCaaPzo.1)\n"
     "• **Англійська мова** (Камишнікова): [Посилання](https://us04web.zoom.us/j/4492224328?pwd=Q21OQjBQdUxWejRMczBRczQ1c0ZSdz09)"
 )
@@ -142,6 +142,7 @@ async def day_schedule(message: Message):
     current_weekday = now.weekday()
     target_weekday = day_map_num[day_name]
     
+    # Всегда показываем предстоящий день недели или сегодняшний
     days_ahead = target_weekday - current_weekday
     if days_ahead < 0:
         days_ahead += 7
@@ -171,13 +172,12 @@ async def today_tomorrow_schedule(message: Message):
 
 @dp.message(F.text == "🔗 Всі посилання на Zoom")
 async def all_zoom(message: Message):
-    await message.answer(ZOOM_ALL, parse_Mode="Markdown", disable_web_page_preview=True)
+    await message.answer(ZOOM_ALL, parse_mode="Markdown", disable_web_page_preview=True)
 
 @dp.message(F.text.in_(["🔄 Замены", "Замены"]))
 async def replacements_info(message: Message):
     await message.answer("🔄 Бот автоматично перевіряє офіційні заміни на поточні дати та коригує розклад.", parse_mode="Markdown")
 
-# Заглушка веб-сервера для Render (чтобы Web Service работал бесплатно и без ошибок порта)
 async def handle(request):
     return web.Response(text="Bot is running!")
 
@@ -198,7 +198,6 @@ async def main():
     
     await fetch_replacements()
     
-    # Запускаем одновременно веб-сервер для Render и бота для Telegram
     await web_server()
     await dp.start_polling(bot)
 
