@@ -9,7 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 from aiohttp import web
 
-TOKEN = "8479473750:AAEq-Sdc5krdwvwIrqxUjeJQ0shOBdU1P3A"
+TOKEN = "8479473750:AAE3OtfpM0Q6NEH_x4Zu8nPXuH5aFC0Gfbo"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
