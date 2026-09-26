@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -16,6 +17,12 @@ from aiohttp import web
 # Токен теперь берётся из переменной окружения BOT_TOKEN (задаётся в Render,
 # в Environment → Environment Variables). В коде и на GitHub его быть не должно.
 TOKEN = os.environ["BOT_TOKEN"]
+
+# Render запускает контейнер в UTC, а не по киевскому времени — если считать
+# "сегодня/завтра" через голый datetime.now(), глубокой ночью (0:00–3:00 по
+# Киеву) сервер ещё будет думать, что идёт предыдущий день. Поэтому везде
+# используем datetime.now(KYIV) вместо datetime.now().
+KYIV = ZoneInfo("Europe/Kyiv")
 
 GROUP_NAME = "А-22"
 
@@ -43,7 +50,7 @@ keyboard = ReplyKeyboardMarkup(
 )
 
 def get_week_type(target_date: datetime):
-    start_date = datetime(2026, 8, 31)
+    start_date = datetime(2026, 8, 31, tzinfo=KYIV)
     target_monday = target_date - timedelta(days=target_date.weekday())
     start_monday = start_date - timedelta(days=start_date.weekday())
     days_diff = (target_monday - start_monday).days
@@ -192,18 +199,18 @@ async def fetch_replacements():
     кладёт разобранные замены в REPLACEMENTS."""
     try:
         announced_date, group_rows = await asyncio.to_thread(_fetch_replacements_sync)
-    except Exception as e:
-        print(f"Ошибка при загрузке замен: {e}")
+    except Exception:
+        logging.exception("Ошибка при загрузке таблицы замен")
         return
 
     if not announced_date:
-        print("🔄 Проверка замен: дата объявления не найдена (или замен пока нет).")
+        logging.info("Проверка замен: дата объявления не найдена (или замен пока нет).")
         return
 
     date_str = announced_date.strftime("%d.%m.%Y")
 
     if not group_rows:
-        print(f"🔄 Проверка замен на {date_str}: для {GROUP_NAME} замен нет.")
+        logging.info("Проверка замен на %s: для %s замен нет.", date_str, GROUP_NAME)
         return
 
     day_map: dict[int, tuple] = {}
@@ -220,7 +227,7 @@ async def fetch_replacements():
                 day_map[int(part)] = (None, full_subject, link)
 
     REPLACEMENTS[date_str] = day_map
-    print(f"🔄 Замены на {date_str} обновлены для {GROUP_NAME}: {day_map}")
+    logging.info("Замены на %s обновлены для %s: %s", date_str, GROUP_NAME, day_map)
 
 
 def send_schedule_for_day(day_name, target_date):
@@ -267,7 +274,7 @@ async def day_schedule(message: Message):
     day_map_num = {"Понеділок": 0, "Вівторок": 1, "Середа": 2, "Четвер": 3, "П'ятниця": 4}
     day_name = message.text.replace("🟢 ", "")
     
-    now = datetime.now()
+    now = datetime.now(KYIV)
     current_weekday = now.weekday()
     target_weekday = day_map_num[day_name]
     
@@ -283,7 +290,7 @@ async def day_schedule(message: Message):
 @dp.message(F.text.in_(["📅 На сегодня", "📅 На завтра", "Расписание на сегодня", "Расписание на завтра"]))
 async def today_tomorrow_schedule(message: Message):
     days_map = {0: "Понеділок", 1: "Вівторок", 2: "Середа", 3: "Четвер", 4: "П'ятниця", 5: "Субота", 6: "Неділя"}
-    now = datetime.now()
+    now = datetime.now(KYIV)
     target_date = now
     
     if "завтра" in message.text.lower():
@@ -308,8 +315,9 @@ async def replacements_info(message: Message):
     await message.answer("🔄 Перевіряю офіційні заміни...")
     await fetch_replacements()
 
-    today_str = datetime.now().strftime("%d.%m.%Y")
-    tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+    now = datetime.now(KYIV)
+    today_str = now.strftime("%d.%m.%Y")
+    tomorrow_str = (now + timedelta(days=1)).strftime("%d.%m.%Y")
 
     parts = []
     for label, date_str in (("на сьогодні", today_str), ("на завтра", tomorrow_str)):
@@ -338,7 +346,7 @@ async def web_server():
 async def main():
     logging.basicConfig(level=logging.INFO)
     
-    scheduler = AsyncIOScheduler(timezone="Europe/Kiev")
+    scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(fetch_replacements, 'cron', hour=17, minute=0)
     scheduler.start()
     
