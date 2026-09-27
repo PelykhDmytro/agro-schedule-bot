@@ -224,7 +224,7 @@ async def fetch_replacements():
 
     if not group_rows:
         logging.info("Проверка замен на %s: для %s замен нет.", date_str, GROUP_NAME)
-        logging.info("Диагностика — все названия групп, найденные в таблице: %s", _all_group_names(raw_rows))
+        logging.info("Диагностика — первые строки таблицы как есть: %s", raw_rows[:6])
         return
 
     day_map: dict[int, tuple] = {}
