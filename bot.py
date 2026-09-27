@@ -118,7 +118,7 @@ ZOOM_BY_SUBJECT = {
     "квіт": "https://us05web.zoom.us/j/9856624171?pwd=vdxkCpVL6bpNo514BbcLE7iKNWLsGK.1",  # квітництво / квітникарство
     "фізр": "https://us04web.zoom.us/j/5318097982?pwd=aK3pQZ6y4arwePmfQlUIXpUQWPndkb.1",
     "грунтознав": "https://us02web.zoom.us/j/3188320656?pwd=QWgycFc4S2JjUXk5ZDhoNnhrYjljdz09&omn=82972358550",
-    "право": "https://us05web.zoom.us/j/7399873325?pwd=SVFFQUsrK3dpSTZ5NHlOWTJPZ2cxQT09",
+    "прав": "https://us05web.zoom.us/j/7399873325?pwd=SVFFQUsrK3dpSTZ5NHlOWTJPZ2cxQT09",
     "еколог": "https://us02web.zoom.us/j/8467559257?pwd=emE1NzZuS0RiV0tOODN6OTFtU0twUT09",
     "інформатик": "https://us02web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09",
     "креслен": "https://us04web.zoom.us/j/74812602094?pwd=LtakeMi2lnjEbJZVqbnt2mbyXUhaxJ.1",
@@ -142,7 +142,7 @@ SUBJECT_ICONS = {
     "квіт": "🌸",           # квітництво
     "фізр": "⚽",           # фізра
     "грунтознав": "🌍",      # ґрунтознавство
-    "право": "⚖️",          # основи права
+    "прав": "⚖️",          # основи права
     "еколог": "🌿",          # екологія
     "інформатик": "💻",      # інформатика
     "креслен": "📐",         # креслення
