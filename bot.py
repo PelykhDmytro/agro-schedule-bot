@@ -179,6 +179,19 @@ def _extract_group_rows(rows: list[list[str]], group_name: str) -> list[dict]:
     return result
 
 
+def _all_group_names(rows: list[list[str]]) -> list[str]:
+    """Диагностика: собирает все непустые значения из первой колонки таблицы —
+    чтобы увидеть, как реально записаны названия групп, если совпадение не нашлось."""
+    names = []
+    for row in rows:
+        if not row:
+            continue
+        first = row[0].strip()
+        if first and first not in names:
+            names.append(f"{first!r} (нормализовано: {_normalize_group(first)!r})")
+    return names
+
+
 def _fetch_replacements_sync():
     """Синхронная (блокирующая) часть — запускается в отдельном потоке,
     чтобы не подвешивать бота во время сетевого запроса."""
@@ -189,16 +202,16 @@ def _fetch_replacements_sync():
 
     announced_date = _find_announcement_date(rows)
     if not announced_date:
-        return None, []
+        return None, [], rows
 
-    return announced_date, _extract_group_rows(rows, GROUP_NAME)
+    return announced_date, _extract_group_rows(rows, GROUP_NAME), rows
 
 
 async def fetch_replacements():
     """Скачивает таблицу замен и, если объявление на сегодня или завтра,
     кладёт разобранные замены в REPLACEMENTS."""
     try:
-        announced_date, group_rows = await asyncio.to_thread(_fetch_replacements_sync)
+        announced_date, group_rows, raw_rows = await asyncio.to_thread(_fetch_replacements_sync)
     except Exception:
         logging.exception("Ошибка при загрузке таблицы замен")
         return
@@ -211,6 +224,7 @@ async def fetch_replacements():
 
     if not group_rows:
         logging.info("Проверка замен на %s: для %s замен нет.", date_str, GROUP_NAME)
+        logging.info("Диагностика — все названия групп, найденные в таблице: %s", _all_group_names(raw_rows))
         return
 
     day_map: dict[int, tuple] = {}
