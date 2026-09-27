@@ -155,18 +155,22 @@ def _find_announcement_date(rows: list[list[str]]):
 
 def _extract_group_rows(rows: list[list[str]], group_name: str) -> list[dict]:
     """Достаёт строки замен для группы, поддерживая "склеенные" ячейки —
-    название группы указано только в первой строке блока, дальше пусто."""
+    название группы указано только в первой строке блока, дальше пусто.
+
+    В реальном CSV-экспорте этой таблицы есть невидимая в браузере пустая
+    колонка A — поэтому данные на самом деле начинаются с колонки B (индекс 1),
+    а не A (индекс 0): группа=1, № пары=2, предмет=3, препод=5."""
     result = []
     current_group = None
     target = _normalize_group(group_name)
 
     for row in rows:
         cells = [c.strip() for c in row]
-        if not any(cells) or len(cells) < 3:
+        if not any(cells) or len(cells) < 4:
             continue
 
-        group_cell, pair_cell, subject_cell = cells[0], cells[1], cells[2]
-        teacher_cell = cells[4] if len(cells) > 4 else ""
+        group_cell, pair_cell, subject_cell = cells[1], cells[2], cells[3]
+        teacher_cell = cells[5] if len(cells) > 5 else ""
 
         if group_cell:
             current_group = group_cell
