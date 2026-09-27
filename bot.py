@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import requests
@@ -25,6 +25,22 @@ TOKEN = os.environ["BOT_TOKEN"]
 KYIV = ZoneInfo("Europe/Kyiv")
 
 GROUP_NAME = "А-22"
+
+# Telegram id старости (и любых других админов через запятую) — узнать у
+# @userinfobot. Только эти люди смогут добавлять домашние задания.
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x
+}
+
+# Хранилище домашних заданий — JSONBin.io (бесплатный внешний JSON-стор).
+# Нужно, потому что на бесплатном Render локальные файлы/память не переживают
+# сон и редеплой сервиса — а домашка должна сохраняться надолго.
+JSONBIN_API_KEY = os.environ.get("JSONBIN_API_KEY")
+JSONBIN_BIN_ID = os.environ.get("JSONBIN_BIN_ID")
+JSONBIN_BASE = "https://api.jsonbin.io/v3/b"
+
+# HOMEWORK[date_str][subject_lower] = текст завдання
+HOMEWORK: dict[str, dict[str, str]] = {}
 
 # ID таблицы замен (кусок ссылки между /d/e/ и /pubhtml)
 SUBSTITUTIONS_SHEET_ID = "2PACX-1vQlLOazl1JOcO5xS1-Ryan5BF2lve26w7lRG-hQTk3J48S8uwm8UtvWJmteeCyqVUtxqJVN7RHUc1I-"
@@ -44,9 +60,11 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="📅 На сегодня"), KeyboardButton(text="📅 На завтра")],
         [KeyboardButton(text="🟢 Понеділок"), KeyboardButton(text="🟢 Вівторок"), KeyboardButton(text="🟢 Середа")],
         [KeyboardButton(text="🟢 Четвер"), KeyboardButton(text="🟢 П'ятниця")],
-        [KeyboardButton(text="🔗 Всі посилання на Zoom"), KeyboardButton(text="🔄 Замены")]
+        [KeyboardButton(text="🔗 Всі посилання на Zoom"), KeyboardButton(text="🔄 Замены")],
+        [KeyboardButton(text="📚 Домашнє завдання")]
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
+    is_persistent=True
 )
 
 def get_week_type(target_date: datetime):
@@ -117,6 +135,87 @@ def find_zoom_for_subject(subject: str) -> str | None:
         if key in low:
             return link
     return None
+
+# Тематическая иконка под конкретный предмет — ключи те же "корни", что и в
+# ZOOM_BY_SUBJECT, чтобы не дублировать логику сопоставления.
+SUBJECT_ICONS = {
+    "квіт": "🌸",           # квітництво
+    "фізр": "⚽",           # фізра
+    "грунтознав": "🌍",      # ґрунтознавство
+    "право": "⚖️",          # основи права
+    "еколог": "🌿",          # екологія
+    "інформатик": "💻",      # інформатика
+    "креслен": "📐",         # креслення
+    "історі": "📜",          # історія
+    "ботаніка": "🌱",        # ботаніка
+    "англійськ": "🇬🇧",       # англійська мова
+}
+
+def subject_icon(subject: str) -> str:
+    if not subject or "Вільн" in subject:
+        return "🆓"
+    low = subject.lower()
+    for key, icon in SUBJECT_ICONS.items():
+        if key in low:
+            return icon
+    return "📘"
+
+
+def canonical_subject_key(text: str) -> str:
+    """Приводит вольное написание предмета к одному из "корневых" ключей из
+    ZOOM_BY_SUBJECT (та же логика, что уже надёжно работает для Zoom-ссылок,
+    и учитывает варианты написания вроде "Квітництво"/"Квітівництво")."""
+    low = text.lower()
+    for key in ZOOM_BY_SUBJECT:
+        if key in low:
+            return key
+    return low
+
+
+def _jsonbin_headers():
+    return {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
+
+
+def _load_homework_sync() -> dict:
+    resp = requests.get(f"{JSONBIN_BASE}/{JSONBIN_BIN_ID}/latest", headers=_jsonbin_headers(), timeout=15)
+    resp.raise_for_status()
+    return resp.json().get("record") or {}
+
+
+def _save_homework_sync(data: dict) -> None:
+    resp = requests.put(f"{JSONBIN_BASE}/{JSONBIN_BIN_ID}", json=data, headers=_jsonbin_headers(), timeout=15)
+    resp.raise_for_status()
+
+
+async def load_homework():
+    """Подтягивает домашку из JSONBin при старте бота (после сна/редеплоя
+    память бота пустая, а в JSONBin данные остались)."""
+    global HOMEWORK
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
+        logging.info("JSONBin не настроен — домашние задания работать не будут (см. README).")
+        return
+    try:
+        HOMEWORK = await asyncio.to_thread(_load_homework_sync)
+        logging.info("Домашні завдання завантажені: %s", HOMEWORK)
+    except Exception:
+        logging.exception("Не вдалося завантажити домашні завдання з JSONBin")
+
+
+async def save_homework():
+    if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
+        return
+    try:
+        await asyncio.to_thread(_save_homework_sync, HOMEWORK)
+    except Exception:
+        logging.exception("Не вдалося зберегти домашні завдання в JSONBin")
+
+
+def find_homework_for(date_str: str, subject_full: str) -> str | None:
+    day_hw = HOMEWORK.get(date_str)
+    if not day_hw or not subject_full:
+        return None
+    entry = day_hw.get(canonical_subject_key(subject_full))
+    return entry["text"] if entry else None
 
 ZOOM_ALL = (
     "🔗 **Всі посилання на Zoom (А-22):**\n\n"
@@ -266,14 +365,21 @@ def send_schedule_for_day(day_name, target_date):
             if "Над рискою:" in subject and "Під рискою:" in subject:
                 lines = subject.split("\n")
                 if week_type == "Над рискою":
-                    subject = lines[0].replace("Над рискою: ", "🎯 ")
+                    subject = lines[0].replace("Над рискою: ", "")
                 else:
-                    subject = lines[1].replace("Під рискою: ", "🎯 ")
-                
+                    subject = lines[1].replace("Під рискою: ", "")
+
+        icon = subject_icon(subject)
+
         if link and "Вільно" not in subject and "Вільна" not in subject:
-            response += f"🔹 **{time_slot}**\n   {subject}\n   🔗 [Підключитися до Zoom]({link})\n\n"
+            response += f"🔹 **{time_slot}**\n   {icon} {subject}\n   🔗 [Підключитися до Zoom]({link})\n"
         else:
-            response += f"🔹 **{time_slot}**\n   {subject}\n\n"
+            response += f"🔹 **{time_slot}**\n   {icon} {subject}\n"
+
+        hw_text = find_homework_for(date_str_formatted, subject)
+        if hw_text:
+            response += f"   📚 ДЗ: {hw_text}\n"
+        response += "\n"
             
     if day_replacements:
         response += "🔄 *Діють офіційні заміни на цей день!*"
@@ -328,6 +434,53 @@ async def today_tomorrow_schedule(message: Message):
 async def all_zoom(message: Message):
     await message.answer(ZOOM_ALL, parse_mode="Markdown", disable_web_page_preview=True)
 
+@dp.message(Command("hw"))
+async def add_homework(message: Message, command: CommandObject):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Ця команда тільки для старости.")
+        return
+
+    args = (command.args or "").strip()
+    parts = [p.strip() for p in args.split("|")]
+    if len(parts) != 3:
+        await message.answer(
+            "Формат: /hw дд.мм.рррр | Предмет | текст завдання\n"
+            "Приклад: /hw 29.09.2026 | Інформатика | Зробити лабу №3"
+        )
+        return
+
+    date_str, subject, text = parts
+    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", date_str):
+        await message.answer("Дата має бути у форматі дд.мм.рррр, наприклад 29.09.2026")
+        return
+
+    key = canonical_subject_key(subject)
+    HOMEWORK.setdefault(date_str, {})[key] = {"subject": subject, "text": text}
+    await save_homework()
+
+    note = "" if (JSONBIN_API_KEY and JSONBIN_BIN_ID) else (
+        "\n\n⚠️ JSONBin не налаштований — це збережеться тільки до перезапуску бота."
+    )
+    await message.answer(f"Збережено: {date_str} — {subject}: {text}{note}")
+
+@dp.message(F.text.in_(["📚 Домашнє завдання", "Домашка"]))
+async def show_homework(message: Message):
+    now = datetime.now(KYIV)
+    today_str = now.strftime("%d.%m.%Y")
+    tomorrow_str = (now + timedelta(days=1)).strftime("%d.%m.%Y")
+
+    parts = []
+    for label, date_str in (("на сьогодні", today_str), ("на завтра", tomorrow_str)):
+        day_hw = HOMEWORK.get(date_str)
+        if day_hw:
+            lines = "\n".join(f"  • {info['subject']}: {info['text']}" for info in day_hw.values())
+            parts.append(f"**Домашнє завдання {label} ({date_str}):**\n{lines}")
+
+    if parts:
+        await message.answer("\n\n".join(parts), parse_mode="Markdown")
+    else:
+        await message.answer("На найближчі дні домашніх завдань не записано 🎉")
+
 @dp.message(F.text.in_(["🔄 Замены", "Замены"]))
 async def replacements_info(message: Message):
     await message.answer("🔄 Перевіряю офіційні заміни...")
@@ -369,6 +522,7 @@ async def main():
     scheduler.start()
     
     await fetch_replacements()
+    await load_homework()
     
     await web_server()
     await dp.start_polling(bot)
