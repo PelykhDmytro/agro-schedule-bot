@@ -604,38 +604,47 @@ async def replacements_info(message: Message):
     else:
         await message.answer("Замін на сьогодні/завтра немає — діє звичайний розклад ✅")
 
+REMINDER_STAGES = [
+    (10, "⏰ Через 10 хвилин"),
+    (5, "⚠️ Через 5 хвилин"),
+    (1, "🚨 УВАГА! Через хвилину"),
+]
+
 async def check_reminders():
-    """Раз в минуту проверяет: не начинается ли у какой-то пары ровно через
-    5 минут — и если да, шлёт напоминание всем подписанным."""
+    """Раз в минуту проверяет: не начинается ли у какой-то пары через 10, 5
+    или 1 хвилину — и если да, шлёт напоминание всем подписанным. Несколько
+    напоминаний подряд сложнее пропустить, чем одно."""
     if not SUBSCRIBERS:
         return
 
     now = datetime.now(KYIV)
-    target = now + timedelta(minutes=5)
-    day_name = DAY_NAMES.get(target.weekday())
-    if day_name not in SCHEDULE:
-        return
 
-    for index, time_slot, subject, link in resolve_day_lessons(day_name, target):
-        m = re.search(r"\((\d{1,2}):(\d{2})-", time_slot)
-        if not m:
-            continue
-        hh, mm = int(m.group(1)), int(m.group(2))
-        if (hh, mm) != (target.hour, target.minute):
-            continue
-        if "Вільно" in subject or "Вільна" in subject:
+    for offset, prefix in REMINDER_STAGES:
+        target = now + timedelta(minutes=offset)
+        day_name = DAY_NAMES.get(target.weekday())
+        if day_name not in SCHEDULE:
             continue
 
-        icon = subject_icon(subject)
-        text = f"⏰ Через 5 хвилин {index} пара:\n{icon} {subject}"
-        if link:
-            text += f"\n🔗 {link}"
+        for index, time_slot, subject, link in resolve_day_lessons(day_name, target):
+            m = re.search(r"\((\d{1,2}):(\d{2})-", time_slot)
+            if not m:
+                continue
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if (hh, mm) != (target.hour, target.minute):
+                continue
+            if "Вільно" in subject or "Вільна" in subject:
+                continue
 
-        for uid in list(SUBSCRIBERS):
-            try:
-                await bot.send_message(int(uid), text)
-            except Exception:
-                logging.exception("Не вдалося надіслати нагадування %s", uid)
+            icon = subject_icon(subject)
+            text = f"{prefix} {index} пара:\n{icon} {subject}"
+            if link:
+                text += f"\n🔗 {link}"
+
+            for uid in list(SUBSCRIBERS):
+                try:
+                    await bot.send_message(int(uid), text)
+                except Exception:
+                    logging.exception("Не вдалося надіслати нагадування %s", uid)
 
 
 async def handle(request):
