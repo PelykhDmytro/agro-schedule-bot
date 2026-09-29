@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -42,6 +42,18 @@ JSONBIN_BASE = "https://api.jsonbin.io/v3/b"
 # HOMEWORK[date_str][subject_lower] = текст завдання
 HOMEWORK: dict[str, dict[str, str]] = {}
 
+# USERS[user_id_str] = {"name", "username", "first_seen", "last_seen", "count"}
+USERS: dict[str, dict] = {}
+
+# Кто подписан на напоминания за 5 минут до пары (user_id как строка)
+SUBSCRIBERS: set[str] = set()
+
+# Общая обёртка над содержимым бина в JSONBin — храним домашку, статистику
+# пользователей и подписки на напоминания вместе, чтобы не заводить много бинов.
+BIN_DATA: dict = {"homework": {}, "users": {}, "subscribers": []}
+
+DAY_NAMES = {0: "Понеділок", 1: "Вівторок", 2: "Середа", 3: "Четвер", 4: "П'ятниця", 5: "Субота", 6: "Неділя"}
+
 # ID таблицы замен (кусок ссылки между /d/e/ и /pubhtml)
 SUBSTITUTIONS_SHEET_ID = "2PACX-1vQlLOazl1JOcO5xS1-Ryan5BF2lve26w7lRG-hQTk3J48S8uwm8UtvWJmteeCyqVUtxqJVN7RHUc1I-"
 SUBSTITUTIONS_CSV_URL = (
@@ -61,7 +73,7 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="🟢 Понеділок"), KeyboardButton(text="🟢 Вівторок"), KeyboardButton(text="🟢 Середа")],
         [KeyboardButton(text="🟢 Четвер"), KeyboardButton(text="🟢 П'ятниця")],
         [KeyboardButton(text="🔗 Всі посилання на Zoom"), KeyboardButton(text="🔄 Замены")],
-        [KeyboardButton(text="📚 Домашнє завдання")]
+        [KeyboardButton(text="📚 Домашнє завдання"), KeyboardButton(text="🔔 Нагадування")]
     ],
     resize_keyboard=True,
     is_persistent=True
@@ -176,38 +188,79 @@ def _jsonbin_headers():
     return {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
 
 
-def _load_homework_sync() -> dict:
+def _load_bin_sync() -> dict:
     resp = requests.get(f"{JSONBIN_BASE}/{JSONBIN_BIN_ID}/latest", headers=_jsonbin_headers(), timeout=15)
     resp.raise_for_status()
     return resp.json().get("record") or {}
 
 
-def _save_homework_sync(data: dict) -> None:
+def _save_bin_sync(data: dict) -> None:
     resp = requests.put(f"{JSONBIN_BASE}/{JSONBIN_BIN_ID}", json=data, headers=_jsonbin_headers(), timeout=15)
     resp.raise_for_status()
 
 
-async def load_homework():
-    """Подтягивает домашку из JSONBin при старте бота (после сна/редеплоя
-    память бота пустая, а в JSONBin данные остались)."""
-    global HOMEWORK
+async def load_bin():
+    """Подтягивает домашку и статистику пользователей из JSONBin при старте
+    бота (после сна/редеплоя память бота пустая, а в JSONBin данные остались)."""
+    global BIN_DATA, HOMEWORK, USERS, SUBSCRIBERS
     if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
-        logging.info("JSONBin не настроен — домашние задания работать не будут (см. README).")
+        logging.info("JSONBin не настроен — домашка, статистика и напоминания работать не будут (см. README).")
         return
     try:
-        HOMEWORK = await asyncio.to_thread(_load_homework_sync)
-        logging.info("Домашні завдання завантажені: %s", HOMEWORK)
+        BIN_DATA = await asyncio.to_thread(_load_bin_sync)
+        HOMEWORK = BIN_DATA.setdefault("homework", {})
+        USERS = BIN_DATA.setdefault("users", {})
+        SUBSCRIBERS = set(BIN_DATA.setdefault("subscribers", []))
+        logging.info(
+            "Дані з JSONBin завантажені: %d дат д/з, %d користувачів, %d підписок на нагадування",
+            len(HOMEWORK), len(USERS), len(SUBSCRIBERS)
+        )
     except Exception:
-        logging.exception("Не вдалося завантажити домашні завдання з JSONBin")
+        logging.exception("Не вдалося завантажити дані з JSONBin")
 
 
-async def save_homework():
+async def save_bin():
     if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
         return
+    BIN_DATA["homework"] = HOMEWORK
+    BIN_DATA["users"] = USERS
+    BIN_DATA["subscribers"] = list(SUBSCRIBERS)
     try:
-        await asyncio.to_thread(_save_homework_sync, HOMEWORK)
+        await asyncio.to_thread(_save_bin_sync, BIN_DATA)
     except Exception:
-        logging.exception("Не вдалося зберегти домашні завдання в JSONBin")
+        logging.exception("Не вдалося зберегти дані в JSONBin")
+
+
+def track_user(user) -> None:
+    """Записывает факт обращения пользователя к боту (в памяти; на диск
+    сохраняется периодически по расписанию, см. main())."""
+    now_iso = datetime.now(KYIV).isoformat(timespec="seconds")
+    uid = str(user.id)
+    name = user.full_name or (f"@{user.username}" if user.username else uid)
+    entry = USERS.get(uid)
+    if entry:
+        entry["last_seen"] = now_iso
+        entry["count"] = entry.get("count", 0) + 1
+        entry["name"] = name
+        entry["username"] = user.username
+    else:
+        USERS[uid] = {
+            "name": name,
+            "username": user.username,
+            "first_seen": now_iso,
+            "last_seen": now_iso,
+            "count": 1,
+        }
+
+
+class UserTrackerMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: Message, data):
+        if event.from_user:
+            track_user(event.from_user)
+        return await handler(event, data)
+
+
+dp.message.middleware(UserTrackerMiddleware())
 
 
 def find_homework_for(date_str: str, subject_full: str) -> str | None:
@@ -347,28 +400,44 @@ async def fetch_replacements():
     logging.info("Замены на %s обновлены для %s: %s", date_str, GROUP_NAME, day_map)
 
 
-def send_schedule_for_day(day_name, target_date):
+def resolve_day_lessons(day_name, target_date):
+    """Возвращает список (индекс пары, время, предмет, ссылка) для конкретного
+    дня и даты, уже с учётом замен и чередования недель над/під рискою.
+    Используется и в выводе расписания, и в напоминаниях."""
     lessons = SCHEDULE.get(day_name)
     if not lessons:
-        return f"📅 На **{day_name}** у групи А-22 занять немає (вихідний) 🎉"
-    
+        return []
+
     week_type = get_week_type(target_date)
-    date_str_formatted = target_date.strftime("%d.%m.%Y")
-    day_replacements = REPLACEMENTS.get(date_str_formatted, {})
-    
-    response = f"📅 **Розклад для групи А-22 — {day_name.upper()}** ({date_str_formatted})\n*(Тиждень: **{week_type}**)*:\n\n"
-    
+    date_str = target_date.strftime("%d.%m.%Y")
+    day_replacements = REPLACEMENTS.get(date_str, {})
+
+    resolved = []
     for index, (time_slot, subject, link) in enumerate(lessons, start=1):
         if index in day_replacements:
             _, subject, link = day_replacements[index]
-        else:
-            if "Над рискою:" in subject and "Під рискою:" in subject:
-                lines = subject.split("\n")
-                if week_type == "Над рискою":
-                    subject = lines[0].replace("Над рискою: ", "")
-                else:
-                    subject = lines[1].replace("Під рискою: ", "")
+        elif "Над рискою:" in subject and "Під рискою:" in subject:
+            lines = subject.split("\n")
+            if week_type == "Над рискою":
+                subject = lines[0].replace("Над рискою: ", "")
+            else:
+                subject = lines[1].replace("Під рискою: ", "")
+        resolved.append((index, time_slot, subject, link))
+    return resolved
 
+
+def send_schedule_for_day(day_name, target_date):
+    lessons = resolve_day_lessons(day_name, target_date)
+    if not lessons:
+        return f"📅 На **{day_name}** у групи А-22 занять немає (вихідний) 🎉"
+
+    week_type = get_week_type(target_date)
+    date_str_formatted = target_date.strftime("%d.%m.%Y")
+    day_replacements = REPLACEMENTS.get(date_str_formatted, {})
+
+    response = f"📅 **Розклад для групи А-22 — {day_name.upper()}** ({date_str_formatted})\n*(Тиждень: **{week_type}**)*:\n\n"
+
+    for index, time_slot, subject, link in lessons:
         icon = subject_icon(subject)
 
         if link and "Вільно" not in subject and "Вільна" not in subject:
@@ -380,7 +449,7 @@ def send_schedule_for_day(day_name, target_date):
         if hw_text:
             response += f"   📚 ДЗ: {hw_text}\n"
         response += "\n"
-            
+
     if day_replacements:
         response += "🔄 *Діють офіційні заміни на цей день!*"
     return response
@@ -434,6 +503,17 @@ async def today_tomorrow_schedule(message: Message):
 async def all_zoom(message: Message):
     await message.answer(ZOOM_ALL, parse_mode="Markdown", disable_web_page_preview=True)
 
+@dp.message(F.text == "🔔 Нагадування")
+async def toggle_reminders(message: Message):
+    uid = str(message.from_user.id)
+    if uid in SUBSCRIBERS:
+        SUBSCRIBERS.discard(uid)
+        await message.answer("Нагадування вимкнено 🔕")
+    else:
+        SUBSCRIBERS.add(uid)
+        await message.answer("Нагадування увімкнено 🔔 — писатиму за 5 хв до кожної пари (крім \"вільно\").")
+    await save_bin()
+
 @dp.message(Command("hw"))
 async def add_homework(message: Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
@@ -456,7 +536,7 @@ async def add_homework(message: Message, command: CommandObject):
 
     key = canonical_subject_key(subject)
     HOMEWORK.setdefault(date_str, {})[key] = {"subject": subject, "text": text}
-    await save_homework()
+    await save_bin()
 
     note = "" if (JSONBIN_API_KEY and JSONBIN_BIN_ID) else (
         "\n\n⚠️ JSONBin не налаштований — це збережеться тільки до перезапуску бота."
@@ -481,6 +561,28 @@ async def show_homework(message: Message):
     else:
         await message.answer("На найближчі дні домашніх завдань не записано 🎉")
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Ця команда тільки для старости.")
+        return
+
+    if not USERS:
+        await message.answer("Поки що ніхто не писав боту.")
+        return
+
+    lines = [f"👥 Унікальних користувачів: {len(USERS)}", ""]
+    for u in sorted(USERS.values(), key=lambda u: u["last_seen"], reverse=True):
+        first = u["first_seen"][:16].replace("T", " ")
+        last = u["last_seen"][:16].replace("T", " ")
+        username = f" (@{u['username']})" if u.get("username") else ""
+        lines.append(f"• {u['name']}{username}\n   повідомлень: {u['count']}, востаннє: {last}, вперше: {first}")
+
+    text = "\n".join(lines)
+    # Telegram режет сообщения длиннее ~4096 символов — на всякий случай рубим на части
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i+4000])
+
 @dp.message(F.text.in_(["🔄 Замены", "Замены"]))
 async def replacements_info(message: Message):
     await message.answer("🔄 Перевіряю офіційні заміни...")
@@ -502,6 +604,40 @@ async def replacements_info(message: Message):
     else:
         await message.answer("Замін на сьогодні/завтра немає — діє звичайний розклад ✅")
 
+async def check_reminders():
+    """Раз в минуту проверяет: не начинается ли у какой-то пары ровно через
+    5 минут — и если да, шлёт напоминание всем подписанным."""
+    if not SUBSCRIBERS:
+        return
+
+    now = datetime.now(KYIV)
+    target = now + timedelta(minutes=5)
+    day_name = DAY_NAMES.get(target.weekday())
+    if day_name not in SCHEDULE:
+        return
+
+    for index, time_slot, subject, link in resolve_day_lessons(day_name, target):
+        m = re.search(r"\((\d{1,2}):(\d{2})-", time_slot)
+        if not m:
+            continue
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if (hh, mm) != (target.hour, target.minute):
+            continue
+        if "Вільно" in subject or "Вільна" in subject:
+            continue
+
+        icon = subject_icon(subject)
+        text = f"⏰ Через 5 хвилин {index} пара:\n{icon} {subject}"
+        if link:
+            text += f"\n🔗 {link}"
+
+        for uid in list(SUBSCRIBERS):
+            try:
+                await bot.send_message(int(uid), text)
+            except Exception:
+                logging.exception("Не вдалося надіслати нагадування %s", uid)
+
+
 async def handle(request):
     return web.Response(text="Bot is running!")
 
@@ -519,10 +655,12 @@ async def main():
     
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(fetch_replacements, 'cron', hour=17, minute=0)
+    scheduler.add_job(save_bin, 'interval', minutes=15)
+    scheduler.add_job(check_reminders, 'interval', minutes=1)
     scheduler.start()
     
     await fetch_replacements()
-    await load_homework()
+    await load_bin()
     
     await web_server()
     await dp.start_polling(bot)
