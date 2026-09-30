@@ -39,6 +39,16 @@ JSONBIN_API_KEY = os.environ.get("JSONBIN_API_KEY")
 JSONBIN_BIN_ID = os.environ.get("JSONBIN_BIN_ID")
 JSONBIN_BASE = "https://api.jsonbin.io/v3/b"
 
+# Google Classroom — автоматическая подтяжка домашних заданий
+CLASSROOM_CLIENT_ID = os.environ.get("CLASSROOM_CLIENT_ID")
+CLASSROOM_CLIENT_SECRET = os.environ.get("CLASSROOM_CLIENT_SECRET")
+CLASSROOM_REFRESH_TOKEN = os.environ.get("CLASSROOM_REFRESH_TOKEN")
+CLASSROOM_SCOPES = [
+    "https://www.googleapis.com/auth/classroom.courses.readonly",
+    "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
+    "https://www.googleapis.com/auth/classroom.announcements.readonly",
+]
+
 # HOMEWORK[date_str][subject_lower] = текст завдання
 HOMEWORK: dict[str, dict[str, str]] = {}
 
@@ -106,7 +116,7 @@ SCHEDULE = {
     "Середа": [
         ("1 пара (8:30-9:50)", "Вільно", None),
         ("2 пара (10:00-11:20)", "Креслення — Переходович Світлана Сергіївна", "https://us04web.zoom.us/j/74812602094?pwd=LtakeMi2lnjEbJZVqbnt2mbyXUhaxJ.1"),
-        ("3 пара (12:00-13:20)", "Історія — Орел Олександр Сергійович", "https://us02web.zoom.us/j/9790221936?omn=71559763873"),
+        ("3 пара (12:00-13:20)", "Історія — Орел Олександр Сергійович", "https://us04web.zoom.us/j/9790221936?pwd=1234567&omn=71559763873"),
         ("4 пара (13:30-13:50)", "Основи права — Циганенко Роман Петрович", "https://us05web.zoom.us/j/7399873325?pwd=SVFFQUsrK3dpSTZ5NHlOWTJPZ2cxQT09")
     ],
     "Четвер": [
@@ -134,7 +144,7 @@ ZOOM_BY_SUBJECT = {
     "еколог": "https://us02web.zoom.us/j/8467559257?pwd=emE1NzZuS0RiV0tOODN6OTFtU0twUT09",
     "інформатик": "https://us02web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09",
     "креслен": "https://us04web.zoom.us/j/74812602094?pwd=LtakeMi2lnjEbJZVqbnt2mbyXUhaxJ.1",
-    "історі": "https://us02web.zoom.us/j/9790221936?omn=71559763873",
+    "історі": "https://us04web.zoom.us/j/9790221936?pwd=1234567&omn=71559763873",
     "ботаніка": "https://us04web.zoom.us/j/75480487895?pwd=REZ04jdCCFGTu8srgqa1vFOXCaaPzo.1",
     "англійськ": "https://us04web.zoom.us/j/4492224328?pwd=Q21OQjBQdUxWejRMczBRczQ1c0ZSdz09",
 }
@@ -182,6 +192,78 @@ def canonical_subject_key(text: str) -> str:
         if key in low:
             return key
     return low
+
+
+def _classroom_configured() -> bool:
+    return bool(CLASSROOM_CLIENT_ID and CLASSROOM_CLIENT_SECRET and CLASSROOM_REFRESH_TOKEN)
+
+
+def _fetch_classroom_sync() -> list[dict]:
+    """Синхронная (блокирующая) часть — идёт в отдельном потоке. Собирает
+    свежие задания (coursework) и оголошення (announcements) по всем активным
+    курсам Google Classroom, к которым привязан авторизованный аккаунт."""
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials(
+        token=None,
+        refresh_token=CLASSROOM_REFRESH_TOKEN,
+        client_id=CLASSROOM_CLIENT_ID,
+        client_secret=CLASSROOM_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=CLASSROOM_SCOPES,
+    )
+    service = build("classroom", "v1", credentials=creds, cache_discovery=False)
+
+    courses = service.courses().list(courseStates=["ACTIVE"]).execute().get("courses", [])
+
+    items = []
+    for course in courses:
+        course_id = course["id"]
+        course_name = course.get("name", "Без назви")
+
+        cw_resp = service.courses().courseWork().list(
+            courseId=course_id, orderBy="dueDate desc", pageSize=10
+        ).execute()
+        for cw in cw_resp.get("courseWork", []):
+            due = cw.get("dueDate")
+            due_str = f"{due['day']:02d}.{due['month']:02d}.{due['year']}" if due else None
+            items.append({
+                "course": course_name,
+                "title": cw.get("title", ""),
+                "description": (cw.get("description") or "").strip(),
+                "due": due_str,
+                "link": cw.get("alternateLink"),
+                "type": "завдання",
+            })
+
+        ann_resp = service.courses().announcements().list(
+            courseId=course_id, orderBy="updateTime desc", pageSize=5
+        ).execute()
+        for ann in ann_resp.get("announcements", []):
+            text = (ann.get("text") or "").strip()
+            if not text:
+                continue
+            items.append({
+                "course": course_name,
+                "title": text[:80],
+                "description": text,
+                "due": None,
+                "link": ann.get("alternateLink"),
+                "type": "оголошення",
+            })
+
+    return items
+
+
+async def fetch_classroom() -> list[dict]:
+    if not _classroom_configured():
+        return []
+    try:
+        return await asyncio.to_thread(_fetch_classroom_sync)
+    except Exception:
+        logging.exception("Не вдалося отримати дані з Google Classroom")
+        return []
 
 
 def _jsonbin_headers():
@@ -279,7 +361,7 @@ ZOOM_ALL = (
     "• **Екологія** (Батіг): [Посилання](https://us02web.zoom.us/j/8467559257?pwd=emE1NzZuS0RiV0tOODN6OTFtU0twUT09)\n"
     "• **Інформатика** (Бембель): [Посилання](https://us07web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09)\n"
     "• **Креслення** (Переходович): [Посилання](https://us04web.zoom.us/j/74812602094?pwd=LtakeMi2lnjEbJZVqbnt2mbyXUhaxJ.1)\n"
-    "• **Історія** (Орел): [Посилання](https://us02web.zoom.us/j/9790221936?omn=71559763873)\n"
+    "• **Історія** (Орел): [Посилання](https://us04web.zoom.us/j/9790221936?pwd=1234567&omn=71559763873)\n"
     "• **Ботаніка** (Сеніна): [Посилання](https://us04web.zoom.us/j/75480487895?pwd=REZ04jdCCFGTu8srgqa1vFOXCaaPzo.1)\n"
     "• **Англійська мова** (Камишнікова): [Посилання](https://us04web.zoom.us/j/4492224328?pwd=Q21OQjBQdUxWejRMczBRczQ1c0ZSdz09)"
 )
