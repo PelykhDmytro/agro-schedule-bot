@@ -45,7 +45,7 @@ CLASSROOM_CLIENT_SECRET = os.environ.get("CLASSROOM_CLIENT_SECRET")
 CLASSROOM_REFRESH_TOKEN = os.environ.get("CLASSROOM_REFRESH_TOKEN")
 CLASSROOM_SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses.readonly",
-    "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
+    "https://www.googleapis.com/auth/classroom.coursework.me",
     "https://www.googleapis.com/auth/classroom.announcements.readonly",
 ]
 
@@ -83,7 +83,8 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="🟢 Понеділок"), KeyboardButton(text="🟢 Вівторок"), KeyboardButton(text="🟢 Середа")],
         [KeyboardButton(text="🟢 Четвер"), KeyboardButton(text="🟢 П'ятниця")],
         [KeyboardButton(text="🔗 Всі посилання на Zoom"), KeyboardButton(text="🔄 Замены")],
-        [KeyboardButton(text="📚 Домашнє завдання"), KeyboardButton(text="🔔 Нагадування")]
+        [KeyboardButton(text="📚 Домашнє завдання"), KeyboardButton(text="🔔 Нагадування")],
+        [KeyboardButton(text="🎓 Classroom")]
     ],
     resize_keyboard=True,
     is_persistent=True
@@ -642,6 +643,44 @@ async def show_homework(message: Message):
         await message.answer("\n\n".join(parts), parse_mode="Markdown")
     else:
         await message.answer("На найближчі дні домашніх завдань не записано 🎉")
+
+@dp.message(F.text == "🎓 Classroom")
+async def show_classroom(message: Message):
+    if not _classroom_configured():
+        await message.answer(
+            "Classroom ще не підключено — не налаштовані CLASSROOM_CLIENT_ID / "
+            "CLASSROOM_CLIENT_SECRET / CLASSROOM_REFRESH_TOKEN."
+        )
+        return
+
+    await message.answer("🎓 Перевіряю Classroom...")
+    items = await fetch_classroom()
+
+    if not items:
+        await message.answer("Нічого не знайшов (або всі курси без активних завдань/оголошень).")
+        return
+
+    # Сортируем: сначала то, что с дедлайном (по возрастанию даты), потом без дедлайна
+    def sort_key(item):
+        if item["due"]:
+            d, m, y = map(int, item["due"].split("."))
+            return (0, y, m, d)
+        return (1, 0, 0, 0)
+
+    items.sort(key=sort_key)
+
+    lines = []
+    for item in items[:15]:
+        emoji = "📌" if item["type"] == "завдання" else "📣"
+        due = f" (до {item['due']})" if item["due"] else ""
+        line = f"{emoji} **{item['course']}**{due}\n{item['title']}"
+        if item["link"]:
+            line += f"\n🔗 [Відкрити]({item['link']})"
+        lines.append(line)
+
+    text = "\n\n".join(lines)
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i+4000], parse_mode="Markdown", disable_web_page_preview=True)
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
