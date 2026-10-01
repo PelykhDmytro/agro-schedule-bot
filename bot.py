@@ -4,7 +4,7 @@ import io
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -224,7 +224,7 @@ def _fetch_classroom_sync() -> list[dict]:
         course_name = course.get("name", "Без назви")
 
         cw_resp = service.courses().courseWork().list(
-            courseId=course_id, orderBy="dueDate desc", pageSize=10
+            courseId=course_id, orderBy="dueDate desc", pageSize=15
         ).execute()
         for cw in cw_resp.get("courseWork", []):
             due = cw.get("dueDate")
@@ -234,6 +234,8 @@ def _fetch_classroom_sync() -> list[dict]:
                 "title": cw.get("title", ""),
                 "description": (cw.get("description") or "").strip(),
                 "due": due_str,
+                "due_date_obj": (due["year"], due["month"], due["day"]) if due else None,
+                "update_time": cw.get("updateTime"),
                 "link": cw.get("alternateLink"),
                 "type": "завдання",
             })
@@ -250,6 +252,8 @@ def _fetch_classroom_sync() -> list[dict]:
                 "title": text[:80],
                 "description": text,
                 "due": None,
+                "due_date_obj": None,
+                "update_time": ann.get("updateTime"),
                 "link": ann.get("alternateLink"),
                 "type": "оголошення",
             })
@@ -258,13 +262,46 @@ def _fetch_classroom_sync() -> list[dict]:
 
 
 async def fetch_classroom() -> list[dict]:
+    """Тянет сырые данные из Classroom и отсеивает "историю" — показываем
+    только то, что ещё не сильно просрочено (или появилось недавно, если без
+    дедлайна), и сортируем по ближайшему дедлайну."""
     if not _classroom_configured():
         return []
     try:
-        return await asyncio.to_thread(_fetch_classroom_sync)
+        items = await asyncio.to_thread(_fetch_classroom_sync)
     except Exception:
         logging.exception("Не вдалося отримати дані з Google Classroom")
         return []
+
+    today = datetime.now(KYIV).date()
+    recent_cutoff = datetime.now(KYIV).astimezone(timezone.utc) - timedelta(days=5)
+
+    filtered = []
+    for item in items:
+        if item["due_date_obj"]:
+            y, m, d = item["due_date_obj"]
+            due_date = datetime(y, m, d).date()
+            if due_date < today - timedelta(days=1):
+                continue  # давно просрочено — неактуально
+        else:
+            ut = item.get("update_time")
+            if not ut:
+                continue
+            try:
+                updated = datetime.fromisoformat(ut.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if updated < recent_cutoff:
+                continue  # старое оголошення без дедлайна — неактуально
+        filtered.append(item)
+
+    def sort_key(item):
+        if item["due_date_obj"]:
+            return (0,) + item["due_date_obj"]
+        return (1, 0, 0, 0)
+
+    filtered.sort(key=sort_key)
+    return filtered[:15]
 
 
 def _jsonbin_headers():
@@ -659,15 +696,6 @@ async def show_classroom(message: Message):
     if not items:
         await message.answer("Нічого не знайшов (або всі курси без активних завдань/оголошень).")
         return
-
-    # Сортируем: сначала то, что с дедлайном (по возрастанию даты), потом без дедлайна
-    def sort_key(item):
-        if item["due"]:
-            d, m, y = map(int, item["due"].split("."))
-            return (0, y, m, d)
-        return (1, 0, 0, 0)
-
-    items.sort(key=sort_key)
 
     lines = []
     for item in items[:15]:
