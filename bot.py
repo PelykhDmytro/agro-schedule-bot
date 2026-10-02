@@ -332,10 +332,19 @@ def _filter_classroom_overdue(items: list[dict]) -> list[dict]:
     return overdue
 
 
+def _strip_leading_date(text: str) -> str:
+    """Убирает дату, которую препод сам пишет в начале названия/тексту
+    (напр. "01.10. Видільні тканини" -> "Видільні тканини") — это дата, когда
+    задали, а не дедлайн, и путает."""
+    return re.sub(r"^\s*\d{1,2}\.\d{1,2}\.?\s*", "", text).strip()
+
+
 def _format_classroom_item(item: dict) -> str:
     emoji = "📌" if item["type"] == "завдання" else "📣"
-    due = f" (до {item['due']})" if item["due"] else ""
-    line = f"{emoji} **{item['course']}**{due}\n{item['title']}"
+    title = _strip_leading_date(item["title"])
+    line = f"{emoji} **{item['course']}**\n{title}"
+    if item["due"]:
+        line += f"\n🔴 **Термін здачі: до {item['due']}**"
     if item["link"]:
         line += f"\n🔗 [Відкрити]({item['link']})"
     return line
