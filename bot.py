@@ -83,8 +83,8 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="🟢 Понеділок"), KeyboardButton(text="🟢 Вівторок"), KeyboardButton(text="🟢 Середа")],
         [KeyboardButton(text="🟢 Четвер"), KeyboardButton(text="🟢 П'ятниця")],
         [KeyboardButton(text="🔗 Всі посилання на Zoom"), KeyboardButton(text="🔄 Замены")],
-        [KeyboardButton(text="📚 Домашнє завдання"), KeyboardButton(text="🔔 Нагадування")],
-        [KeyboardButton(text="🎓 Classroom")]
+        [KeyboardButton(text="🔔 Нагадування")],
+        [KeyboardButton(text="🎓 Classroom"), KeyboardButton(text="⚠️ Прострочені")]
     ],
     resize_keyboard=True,
     is_persistent=True
@@ -262,27 +262,41 @@ def _fetch_classroom_sync() -> list[dict]:
 
 
 async def fetch_classroom() -> list[dict]:
-    """Тянет сырые данные из Classroom и отсеивает "историю" — показываем
-    только то, что ещё не сильно просрочено (или появилось недавно, если без
-    дедлайна), и сортируем по ближайшему дедлайну."""
+    """Тянет сырые данные из Classroom (без фильтрации по срокам — это делают
+    отдельно _group_classroom_actual и _filter_classroom_overdue)."""
     if not _classroom_configured():
         return []
     try:
-        items = await asyncio.to_thread(_fetch_classroom_sync)
+        return await asyncio.to_thread(_fetch_classroom_sync)
     except Exception:
         logging.exception("Не вдалося отримати дані з Google Classroom")
         return []
 
+
+def _group_classroom_actual(items: list[dict]) -> dict[str, list[dict]]:
+    """Делит ещё не просроченные задания на корзины по оставшемуся сроку —
+    как на твоей схеме: до 3 днів / до тижня / до місяця / пізніше, плюс
+    отдельно свіжі оголошення без дедлайну."""
     today = datetime.now(KYIV).date()
     recent_cutoff = datetime.now(KYIV).astimezone(timezone.utc) - timedelta(days=5)
 
-    filtered = []
+    buckets: dict[str, list[dict]] = {"soon": [], "week": [], "month": [], "later": [], "nodate": []}
+
     for item in items:
         if item["due_date_obj"]:
             y, m, d = item["due_date_obj"]
             due_date = datetime(y, m, d).date()
-            if due_date < today - timedelta(days=1):
-                continue  # давно просрочено — неактуально
+            if due_date < today:
+                continue  # просрочено — не сюда, это для отдельной кнопки
+            days_left = (due_date - today).days
+            if days_left <= 3:
+                buckets["soon"].append(item)
+            elif days_left <= 7:
+                buckets["week"].append(item)
+            elif days_left <= 30:
+                buckets["month"].append(item)
+            else:
+                buckets["later"].append(item)
         else:
             ut = item.get("update_time")
             if not ut:
@@ -293,15 +307,41 @@ async def fetch_classroom() -> list[dict]:
                 continue
             if updated < recent_cutoff:
                 continue  # старое оголошення без дедлайна — неактуально
-        filtered.append(item)
+            buckets["nodate"].append(item)
 
-    def sort_key(item):
-        if item["due_date_obj"]:
-            return (0,) + item["due_date_obj"]
-        return (1, 0, 0, 0)
+    for key in ("soon", "week", "month", "later"):
+        buckets[key].sort(key=lambda it: it["due_date_obj"])
 
-    filtered.sort(key=sort_key)
-    return filtered[:15]
+    return buckets
+
+
+def _filter_classroom_overdue(items: list[dict]) -> list[dict]:
+    """Все задания с дедлайном в прошлом, свіжі прострочені — зверху."""
+    today = datetime.now(KYIV).date()
+    overdue = []
+    for item in items:
+        if not item["due_date_obj"]:
+            continue
+        y, m, d = item["due_date_obj"]
+        due_date = datetime(y, m, d).date()
+        if due_date < today:
+            overdue.append(item)
+    overdue.sort(key=lambda it: it["due_date_obj"], reverse=True)
+    return overdue
+
+
+def _format_classroom_item(item: dict) -> str:
+    emoji = "📌" if item["type"] == "завдання" else "📣"
+    due = f" (до {item['due']})" if item["due"] else ""
+    line = f"{emoji} **{item['course']}**{due}\n{item['title']}"
+    if item["link"]:
+        line += f"\n🔗 [Відкрити]({item['link']})"
+    return line
+
+
+async def _send_long_text(message: Message, text: str):
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i + 4000], parse_mode="Markdown", disable_web_page_preview=True)
 
 
 def _jsonbin_headers():
@@ -697,18 +737,46 @@ async def show_classroom(message: Message):
         await message.answer("Нічого не знайшов (або всі курси без активних завдань/оголошень).")
         return
 
-    lines = []
-    for item in items[:15]:
-        emoji = "📌" if item["type"] == "завдання" else "📣"
-        due = f" (до {item['due']})" if item["due"] else ""
-        line = f"{emoji} **{item['course']}**{due}\n{item['title']}"
-        if item["link"]:
-            line += f"\n🔗 [Відкрити]({item['link']})"
-        lines.append(line)
+    buckets = _group_classroom_actual(items)
+    section_labels = [
+        ("soon", "🔴 Найближчі (до 3 днів)"),
+        ("week", "🟡 До тижня"),
+        ("month", "🟢 До місяця"),
+        ("later", "📅 Пізніше"),
+        ("nodate", "📣 Свіжі оголошення"),
+    ]
 
-    text = "\n\n".join(lines)
-    for i in range(0, len(text), 4000):
-        await message.answer(text[i:i+4000], parse_mode="Markdown", disable_web_page_preview=True)
+    sections = []
+    for key, label in section_labels:
+        group = buckets[key][:10]
+        if not group:
+            continue
+        sections.append("\n\n".join([f"**{label}**"] + [_format_classroom_item(it) for it in group]))
+
+    if not sections:
+        await message.answer("Актуальних завдань немає 🎉")
+        return
+
+    await _send_long_text(message, "\n\n━━━━━━━━━━\n\n".join(sections))
+
+@dp.message(F.text == "⚠️ Прострочені")
+async def show_classroom_overdue(message: Message):
+    if not _classroom_configured():
+        await message.answer(
+            "Classroom ще не підключено — не налаштовані CLASSROOM_CLIENT_ID / "
+            "CLASSROOM_CLIENT_SECRET / CLASSROOM_REFRESH_TOKEN."
+        )
+        return
+
+    await message.answer("⚠️ Перевіряю прострочені завдання...")
+    items = await fetch_classroom()
+    overdue = _filter_classroom_overdue(items)[:15]
+
+    if not overdue:
+        await message.answer("Прострочених завдань немає 🎉")
+        return
+
+    await _send_long_text(message, "\n\n".join(_format_classroom_item(it) for it in overdue))
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
