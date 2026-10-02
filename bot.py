@@ -197,6 +197,17 @@ def canonical_subject_key(text: str) -> str:
     return low
 
 
+URL_RE = re.compile(r"https?://\S+")
+
+
+def _clean_announcement_text(text: str) -> str:
+    """Убирает ссылки (на Zoom и любые другие) из текста оголошення — они
+    только дублируют то, что уже есть в расписании, и захламляют вывод."""
+    text = URL_RE.sub("", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
 def _classroom_configured() -> bool:
     return bool(CLASSROOM_CLIENT_ID and CLASSROOM_CLIENT_SECRET and CLASSROOM_REFRESH_TOKEN)
 
@@ -246,13 +257,16 @@ def _fetch_classroom_sync() -> list[dict]:
             courseId=course_id, orderBy="updateTime desc", pageSize=5
         ).execute()
         for ann in ann_resp.get("announcements", []):
-            text = (ann.get("text") or "").strip()
-            if not text:
+            raw_text = (ann.get("text") or "").strip()
+            if not raw_text:
                 continue
+            cleaned = _clean_announcement_text(raw_text)
+            if len(cleaned) < 20:
+                continue  # оголошення було тільки посиланням — показувати нічого
             items.append({
                 "course": course_name,
-                "title": text[:80],
-                "description": text,
+                "title": cleaned[:80],
+                "description": cleaned,
                 "due": None,
                 "due_date_obj": None,
                 "update_time": ann.get("updateTime"),
