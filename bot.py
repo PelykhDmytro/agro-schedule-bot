@@ -9,7 +9,10 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import requests
 from aiohttp import web
@@ -83,8 +86,7 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="🟢 Понеділок"), KeyboardButton(text="🟢 Вівторок"), KeyboardButton(text="🟢 Середа")],
         [KeyboardButton(text="🟢 Четвер"), KeyboardButton(text="🟢 П'ятниця")],
         [KeyboardButton(text="🔗 Всі посилання на Zoom"), KeyboardButton(text="🔄 Замены")],
-        [KeyboardButton(text="🔔 Нагадування")],
-        [KeyboardButton(text="🎓 Classroom"), KeyboardButton(text="⚠️ Прострочені")]
+        [KeyboardButton(text="🔔 Нагадування"), KeyboardButton(text="🎓 Classroom")]
     ],
     resize_keyboard=True,
     is_persistent=True
@@ -721,43 +723,60 @@ async def show_homework(message: Message):
     else:
         await message.answer("На найближчі дні домашніх завдань не записано 🎉")
 
+def _classroom_not_configured_text() -> str:
+    return (
+        "Classroom ще не підключено — не налаштовані CLASSROOM_CLIENT_ID / "
+        "CLASSROOM_CLIENT_SECRET / CLASSROOM_REFRESH_TOKEN."
+    )
+
+
+CLASSROOM_MENU = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🔴 Найближчі 3 дні", callback_data="cls_soon")],
+    [InlineKeyboardButton(text="🟡 На тиждень", callback_data="cls_week")],
+    [InlineKeyboardButton(text="📋 Всі актуальні", callback_data="cls_all")],
+    [InlineKeyboardButton(text="⚠️ Прострочені", callback_data="cls_overdue")],
+])
+
+
 @dp.message(F.text == "🎓 Classroom")
-async def show_classroom(message: Message):
+async def classroom_menu(message: Message):
+    await message.answer("Що показати з Classroom?", reply_markup=CLASSROOM_MENU)
+
+
+@dp.callback_query(F.data.startswith("cls_"))
+async def classroom_callback(callback: CallbackQuery):
+    await callback.answer()
+
     if not _classroom_configured():
-        await message.answer(
-            "Classroom ще не підключено — не налаштовані CLASSROOM_CLIENT_ID / "
-            "CLASSROOM_CLIENT_SECRET / CLASSROOM_REFRESH_TOKEN."
-        )
+        await callback.message.answer(_classroom_not_configured_text())
         return
 
-    await message.answer("🎓 Перевіряю Classroom...")
+    await callback.message.answer("⏳ Перевіряю Classroom...")
     items = await fetch_classroom()
-
-    if not items:
-        await message.answer("Нічого не знайшов (або всі курси без активних завдань/оголошень).")
-        return
-
     buckets = _group_classroom_actual(items)
-    section_labels = [
-        ("soon", "🔴 Найближчі (до 3 днів)"),
-        ("week", "🟡 До тижня"),
-        ("month", "🟢 До місяця"),
-        ("later", "📅 Пізніше"),
-        ("nodate", "📣 Свіжі оголошення"),
-    ]
+    action = callback.data
 
-    sections = []
-    for key, label in section_labels:
-        group = buckets[key][:10]
-        if not group:
-            continue
-        sections.append("\n\n".join([f"**{label}**"] + [_format_classroom_item(it) for it in group]))
-
-    if not sections:
-        await message.answer("Актуальних завдань немає 🎉")
+    if action == "cls_soon":
+        group, empty_text = buckets["soon"][:10], "На найближчі 3 дні завдань немає 🎉"
+    elif action == "cls_week":
+        group = (buckets["soon"] + buckets["week"])[:15]
+        group.sort(key=lambda it: it["due_date_obj"])
+        empty_text = "На найближчий тиждень завдань немає 🎉"
+    elif action == "cls_all":
+        group = buckets["soon"] + buckets["week"] + buckets["month"] + buckets["later"]
+        group.sort(key=lambda it: it["due_date_obj"])
+        group = (group + buckets["nodate"])[:25]
+        empty_text = "Актуальних завдань і оголошень немає 🎉"
+    elif action == "cls_overdue":
+        group, empty_text = _filter_classroom_overdue(items)[:15], "Прострочених завдань немає 🎉"
+    else:
         return
 
-    await _send_long_text(message, "\n\n━━━━━━━━━━\n\n".join(sections))
+    if not group:
+        await callback.message.answer(empty_text)
+        return
+
+    await _send_long_text(callback.message, "\n\n".join(_format_classroom_item(it) for it in group))
 
 @dp.message(F.text == "⚠️ Прострочені")
 async def show_classroom_overdue(message: Message):
