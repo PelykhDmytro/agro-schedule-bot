@@ -197,24 +197,13 @@ def canonical_subject_key(text: str) -> str:
     return low
 
 
-URL_RE = re.compile(r"https?://\S+")
-
-
-def _clean_announcement_text(text: str) -> str:
-    """Убирает ссылки (на Zoom и любые другие) из текста оголошення — они
-    только дублируют то, что уже есть в расписании, и захламляют вывод."""
-    text = URL_RE.sub("", text)
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    return text.strip()
-
-
 def _classroom_configured() -> bool:
     return bool(CLASSROOM_CLIENT_ID and CLASSROOM_CLIENT_SECRET and CLASSROOM_REFRESH_TOKEN)
 
 
 def _fetch_classroom_sync() -> list[dict]:
     """Синхронная (блокирующая) часть — идёт в отдельном потоке. Собирает
-    свежие задания (coursework) и оголошення (announcements) по всем активным
+    свежие задания (coursework) по всем активным
     курсам Google Classroom, к которым привязан авторизованный аккаунт."""
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -253,27 +242,6 @@ def _fetch_classroom_sync() -> list[dict]:
                 "type": "завдання",
             })
 
-        ann_resp = service.courses().announcements().list(
-            courseId=course_id, orderBy="updateTime desc", pageSize=5
-        ).execute()
-        for ann in ann_resp.get("announcements", []):
-            raw_text = (ann.get("text") or "").strip()
-            if not raw_text:
-                continue
-            cleaned = _clean_announcement_text(raw_text)
-            if len(cleaned) < 20:
-                continue  # оголошення було тільки посиланням — показувати нічого
-            items.append({
-                "course": course_name,
-                "title": cleaned[:80],
-                "description": cleaned,
-                "due": None,
-                "due_date_obj": None,
-                "update_time": ann.get("updateTime"),
-                "link": ann.get("alternateLink"),
-                "type": "оголошення",
-            })
-
     return items
 
 
@@ -292,7 +260,7 @@ async def fetch_classroom() -> list[dict]:
 def _group_classroom_actual(items: list[dict]) -> dict[str, list[dict]]:
     """Делит ещё не просроченные задания на корзины по оставшемуся сроку —
     как на твоей схеме: до 3 днів / до тижня / до місяця / пізніше, плюс
-    отдельно свіжі оголошення без дедлайну."""
+    отдельно свіжі завдання без дедлайну."""
     today = datetime.now(KYIV).date()
     recent_cutoff = datetime.now(KYIV).astimezone(timezone.utc) - timedelta(days=5)
 
@@ -322,7 +290,7 @@ def _group_classroom_actual(items: list[dict]) -> dict[str, list[dict]]:
             except ValueError:
                 continue
             if updated < recent_cutoff:
-                continue  # старое оголошення без дедлайна — неактуально
+                continue  # старое завдання без дедлайна — неактуально
             buckets["nodate"].append(item)
 
     for key in ("soon", "week", "month", "later"):
@@ -354,11 +322,21 @@ def _strip_leading_date(text: str) -> str:
 
 
 def _format_classroom_item(item: dict) -> str:
-    emoji = "📌" if item["type"] == "завдання" else "📣"
     title = _strip_leading_date(item["title"])
-    line = f"{emoji} **{item['course']}**\n{title}"
-    if item["due"]:
-        line += f"\n🔴 **Термін здачі: до {item['due']}**"
+    line = f"📌 **{item['course']}**\n{title}"
+
+    if item["due_date_obj"]:
+        today = datetime.now(KYIV).date()
+        y, m, d = item["due_date_obj"]
+        days_left = ((datetime(y, m, d).date()) - today).days
+        if days_left <= 3:
+            marker = "🔴"
+        elif days_left <= 7:
+            marker = "🟡"
+        else:
+            marker = "🟢"
+        line += f"\n{marker} **Термін здачі: до {item['due']}**"
+
     if item["link"]:
         line += f"\n🔗 [Відкрити]({item['link']})"
     return line
@@ -789,7 +767,7 @@ async def classroom_callback(callback: CallbackQuery):
         group = buckets["soon"] + buckets["week"] + buckets["month"] + buckets["later"]
         group.sort(key=lambda it: it["due_date_obj"])
         group = (group + buckets["nodate"])[:25]
-        empty_text = "Актуальних завдань і оголошень немає 🎉"
+        empty_text = "Актуальних завдань немає 🎉"
     elif action == "cls_overdue":
         group, empty_text = _filter_classroom_overdue(items)[:15], "Прострочених завдань немає 🎉"
     else:
