@@ -108,32 +108,32 @@ SCHEDULE = {
         ("1 пара (8:30-9:50)", "Вільно", None),
         ("2 пара (10:00-11:20)", "Квітівництво — Жупіньська Катерина Юріївна", "https://us05web.zoom.us/j/9856624171?pwd=vdxkCpVL6bpNo514BbcLE7iKNWLsGK.1"),
         ("3 пара (12:00-13:20)", "Фізра — Тетяна Дрокина", "https://us04web.zoom.us/j/5318097982?pwd=aK3pQZ6y4arwePmfQlUIXpUQWPndkb.1"),
-        ("4 пара (13:30-13:50)", "Над рискою: Грунтознавство — Ковалжи Наталія Ігорівна\nПід рискою: Основи права — Циганенко Роман Петрович", "https://us02web.zoom.us/j/3188320656?pwd=QWgycFc4S2JjUXk5ZDhoNnhrYjljdz09&omn=82972358550"),
+        ("4 пара (13:30-14:50)", "Над рискою: Грунтознавство — Ковалжи Наталія Ігорівна\nПід рискою: Основи права — Циганенко Роман Петрович", "https://us02web.zoom.us/j/3188320656?pwd=QWgycFc4S2JjUXk5ZDhoNnhrYjljdz09&omn=82972358550"),
         ("Класний час (11:00-11:45)", "Класний час — Тетяна Рєзнік", "https://us04web.zoom.us/j/7383992789?pwd=EsaUDEGNkThFS3cmK3R0CDeRn3sUtZ.1&omn=72038980716")
     ],
     "Вівторок": [
         ("1 пара (8:30-9:50)", "Вільно", None),
         ("2 пара (10:00-11:20)", "Вільно", None),
         ("3 пара (12:00-13:20)", "Екологія — Батіг Ганна Володимирівна", "https://us02web.zoom.us/j/8467559257?pwd=emE1NzZuS0RiV0tOODN6OTFtU0twUT09"),
-        ("4 пара (13:30-13:50)", "Інформатика — Бембель Олександр Дмитрович", "https://us02web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09")
+        ("4 пара (13:30-14:50)", "Інформатика — Бембель Олександр Дмитрович", "https://us02web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09")
     ],
     "Середа": [
         ("1 пара (8:30-9:50)", "Вільно", None),
         ("2 пара (10:00-11:20)", "Креслення — Переходович Світлана Сергіївна", "https://us04web.zoom.us/j/74812602094?pwd=LtakeMi2lnjEbJZVqbnt2mbyXUhaxJ.1"),
         ("3 пара (12:00-13:20)", "Історія — Орел Олександр Сергійович", "https://us04web.zoom.us/j/9790221936?pwd=1234567&omn=71559763873"),
-        ("4 пара (13:30-13:50)", "Основи права — Циганенко Роман Петрович", "https://us05web.zoom.us/j/7399873325?pwd=SVFFQUsrK3dpSTZ5NHlOWTJPZ2cxQT09")
+        ("4 пара (13:30-14:50)", "Основи права — Циганенко Роман Петрович", "https://us05web.zoom.us/j/7399873325?pwd=SVFFQUsrK3dpSTZ5NHlOWTJPZ2cxQT09")
     ],
     "Четвер": [
         ("1 пара (8:30-9:50)", "Вільно", None),
         ("2 пара (10:00-11:20)", "Грунтознавство — Ковалжи Наталія Ігорівна", "https://us02web.zoom.us/j/3188320656?pwd=QWgycFc4S2JjUXk5ZDhoNnhrYjljdz09&omn=82972358550"),
         ("3 пара (12:00-13:20)", "Ботаніка — Сеніна Ірина Леонідівна", "https://us04web.zoom.us/j/75480487895?pwd=REZ04jdCCFGTu8srgqa1vFOXCaaPzo.1"),
-        ("4 пара (13:30-13:50)", "Інформатика — Бембель Олександр Дмитрович", "https://us02web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09")
+        ("4 пара (13:30-14:50)", "Інформатика — Бембель Олександр Дмитрович", "https://us02web.zoom.us/j/7546161590?pwd=Yk8vNWU2bnpXSFpsTHBPZHBGOWV3dz09")
     ],
     "П'ятниця": [
         ("1 пара (8:30-9:50)", "Ботаніка — Сеніна Ірина Леонідівна", "https://us04web.zoom.us/j/75480487895?pwd=REZ04jdCCFGTu8srgqa1vFOXCaaPzo.1"),
         ("2 пара (10:00-11:20)", "Англійська мова — Камишнікова Анна", "https://us04web.zoom.us/j/4492224328?pwd=Q21OQjBQdUxWejRMczBRczQ1c0ZSdz09"),
         ("3 пара (12:00-13:20)", "Вільно", None),
-        ("4 пара (13:30-13:50)", "Вільно", None)
+        ("4 пара (13:30-14:50)", "Вільно", None)
     ]
 }
 
@@ -321,6 +321,19 @@ def _strip_leading_date(text: str) -> str:
     (напр. "01.10. Видільні тканини" -> "Видільні тканини") — это дата, когда
     задали, а не дедлайн, и путает."""
     return re.sub(r"^\s*\d{1,2}\.\d{1,2}\.?\s*", "", text).strip()
+
+
+def _filter_classroom_today(items: list[dict]) -> list[dict]:
+    """Задания, дедлайн которых — сегодня (до 23:59 по Киеву)."""
+    today = datetime.now(KYIV).date()
+    result = []
+    for item in items:
+        if not item["due_date_obj"]:
+            continue
+        y, m, d = item["due_date_obj"]
+        if datetime(y, m, d).date() == today:
+            result.append(item)
+    return result
 
 
 def _format_classroom_item(item: dict) -> str:
@@ -735,6 +748,7 @@ def _classroom_not_configured_text() -> str:
 
 
 CLASSROOM_MENU = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="⏰ Здати сьогодні (до 23:59)", callback_data="cls_today")],
     [InlineKeyboardButton(text="🔴 Найближчі 3 дні", callback_data="cls_soon")],
     [InlineKeyboardButton(text="🟡 На тиждень", callback_data="cls_week")],
     [InlineKeyboardButton(text="📋 Всі актуальні", callback_data="cls_all")],
@@ -760,7 +774,10 @@ async def classroom_callback(callback: CallbackQuery):
     buckets = _group_classroom_actual(items)
     action = callback.data
 
-    if action == "cls_soon":
+    if action == "cls_today":
+        group = _filter_classroom_today(items)
+        empty_text = "На сьогодні здавати нічого 🎉"
+    elif action == "cls_soon":
         group, empty_text = buckets["soon"][:10], "На найближчі 3 дні завдань немає 🎉"
     elif action == "cls_week":
         group = (buckets["soon"] + buckets["week"])[:15]
