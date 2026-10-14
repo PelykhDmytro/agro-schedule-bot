@@ -220,7 +220,7 @@ def _fetch_classroom_sync() -> list[dict]:
     )
     service = build("classroom", "v1", credentials=creds, cache_discovery=False)
 
-    courses = service.courses().list(courseStates=["ACTIVE"]).execute().get("courses", [])
+    courses = service.courses().list(courseStates=["ACTIVE"]).execute(num_retries=3).get("courses", [])
 
     items = []
     for course in courses:
@@ -229,7 +229,7 @@ def _fetch_classroom_sync() -> list[dict]:
 
         cw_resp = service.courses().courseWork().list(
             courseId=course_id, orderBy="dueDate desc", pageSize=15
-        ).execute()
+        ).execute(num_retries=3)
         for cw in cw_resp.get("courseWork", []):
             due = cw.get("dueDate")
             due_str = f"{due['day']:02d}.{due['month']:02d}.{due['year']}" if due else None
@@ -244,19 +244,47 @@ def _fetch_classroom_sync() -> list[dict]:
                 "type": "завдання",
             })
 
+    logging.info("Classroom: курсів %d, завдань %d", len(courses), len(items))
     return items
 
 
-async def fetch_classroom() -> list[dict]:
+_CLASSROOM_CACHE: dict = {"time": None, "items": None}
+CLASSROOM_CACHE_SECONDS = 120
+
+
+async def fetch_classroom() -> list[dict] | None:
     """Тянет сырые данные из Classroom (без фильтрации по срокам — это делают
-    отдельно _group_classroom_actual и _filter_classroom_overdue)."""
+    отдельно _group_classroom_actual и _filter_classroom_overdue).
+
+    ВАЖНО: при сбое возвращает None (а не пустой список!) — чтобы бот не путал
+    "не смог получить данные" с "заданий нет". Успешный ответ кэшируется на
+    пару минут, чтобы подряд нажатые кнопки не дёргали Google по несколько раз."""
     if not _classroom_configured():
         return []
-    try:
-        return await asyncio.to_thread(_fetch_classroom_sync)
-    except Exception:
-        logging.exception("Не вдалося отримати дані з Google Classroom")
-        return []
+
+    now = datetime.now(timezone.utc)
+    cached_at = _CLASSROOM_CACHE["time"]
+    if cached_at and _CLASSROOM_CACHE["items"] is not None:
+        if (now - cached_at).total_seconds() < CLASSROOM_CACHE_SECONDS:
+            return _CLASSROOM_CACHE["items"]
+
+    for attempt in (1, 2):
+        try:
+            items = await asyncio.to_thread(_fetch_classroom_sync)
+            _CLASSROOM_CACHE["time"] = now
+            _CLASSROOM_CACHE["items"] = items
+            return items
+        except Exception:
+            logging.exception("Не вдалося отримати дані з Google Classroom (спроба %d/2)", attempt)
+            if attempt == 1:
+                await asyncio.sleep(2)
+    return None
+
+
+CLASSROOM_ERROR_TEXT = (
+    "⚠️ Не вдалося зв'язатися з Google Classroom. Це не означає, що завдань немає — "
+    "спробуй ще раз за хвилину."
+)
 
 
 def _group_classroom_actual(items: list[dict]) -> dict[str, list[dict]]:
@@ -771,6 +799,9 @@ async def classroom_callback(callback: CallbackQuery):
 
     await callback.message.answer("⏳ Перевіряю Classroom...")
     items = await fetch_classroom()
+    if items is None:
+        await callback.message.answer(CLASSROOM_ERROR_TEXT)
+        return
     buckets = _group_classroom_actual(items)
     action = callback.data
 
@@ -798,25 +829,6 @@ async def classroom_callback(callback: CallbackQuery):
         return
 
     await _send_long_text(callback.message, "\n\n".join(_format_classroom_item(it) for it in group))
-
-@dp.message(F.text == "⚠️ Прострочені")
-async def show_classroom_overdue(message: Message):
-    if not _classroom_configured():
-        await message.answer(
-            "Classroom ще не підключено — не налаштовані CLASSROOM_CLIENT_ID / "
-            "CLASSROOM_CLIENT_SECRET / CLASSROOM_REFRESH_TOKEN."
-        )
-        return
-
-    await message.answer("⚠️ Перевіряю прострочені завдання...")
-    items = await fetch_classroom()
-    overdue = _filter_classroom_overdue(items)[:15]
-
-    if not overdue:
-        await message.answer("Прострочених завдань немає 🎉")
-        return
-
-    await _send_long_text(message, "\n\n".join(_format_classroom_item(it) for it in overdue))
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
