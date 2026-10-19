@@ -151,16 +151,54 @@ ZOOM_BY_SUBJECT = {
     "історі": "https://us04web.zoom.us/j/9790221936?pwd=1234567&omn=71559763873",
     "ботаніка": "https://us04web.zoom.us/j/75480487895?pwd=REZ04jdCCFGTu8srgqa1vFOXCaaPzo.1",
     "англійськ": "https://us04web.zoom.us/j/4492224328?pwd=Q21OQjBQdUxWejRMczBRczQ1c0ZSdz09",
+    "класний час": "https://us04web.zoom.us/j/7383992789?pwd=EsaUDEGNkThFS3cmK3R0CDeRn3sUtZ.1&omn=72038980716",
 }
 
-def find_zoom_for_subject(subject: str) -> str | None:
-    if not subject:
+# Визуально одинаковые латинские и кириллические буквы: в таблицах колледжа
+# иногда встречаются перемешанные («BIЛЬHA»). Приводим всё к кириллице, чтобы
+# сравнение текста не ломалось из-за невидимой глазу разницы. Заодно ґ -> г.
+_LOOKALIKES = str.maketrans({
+    "a": "а", "b": "в", "c": "с", "e": "е", "h": "н", "i": "і",
+    "k": "к", "m": "м", "o": "о", "p": "р", "t": "т", "x": "х", "y": "у",
+    "ґ": "г",
+})
+
+
+def _norm(text: str | None) -> str:
+    """Нижний регистр + латинские «двойники» -> кириллица + ґ -> г."""
+    return (text or "").lower().translate(_LOOKALIKES)
+
+
+def is_free_lesson(subject: str | None) -> bool:
+    """Пара свободна — в любом написании: Вільно / Вільна / ВІЛЬНА / вільна."""
+    return "вільн" in _norm(subject)
+
+
+# Другие названия тех же предметов, как их пишет колледж в таблице замен.
+ROOT_ALIASES = {
+    "фізичн": "фізр",        # «Фізична культура» / «Фізичне виховання» = «Фізра»
+    "іноземн": "англійськ",  # «Іноземна мова» = «Англійська мова»
+}
+
+
+def subject_root(subject: str | None) -> str | None:
+    """Находит «корень» предмета (ключ из SUBJECT_ICONS / ZOOM_BY_SUBJECT) по
+    вольному написанию. Единая точка для Zoom-ссылки, иконки и домашки."""
+    low = _norm(subject)
+    if not low:
         return None
-    low = subject.lower()
-    for key, link in ZOOM_BY_SUBJECT.items():
+    for key in SUBJECT_ICONS:
         if key in low:
-            return link
+            return key
+    for alias, key in ROOT_ALIASES.items():
+        if alias in low:
+            return key
     return None
+
+
+def find_zoom_for_subject(subject: str) -> str | None:
+    root = subject_root(subject)
+    return ZOOM_BY_SUBJECT.get(root) if root else None
 
 # Тематическая иконка под конкретный предмет — ключи те же "корни", что и в
 # ZOOM_BY_SUBJECT, чтобы не дублировать логику сопоставления.
@@ -179,24 +217,17 @@ SUBJECT_ICONS = {
 }
 
 def subject_icon(subject: str) -> str:
-    if not subject or "Вільн" in subject:
+    if not subject or is_free_lesson(subject):
         return "🆓"
-    low = subject.lower()
-    for key, icon in SUBJECT_ICONS.items():
-        if key in low:
-            return icon
-    return "📘"
+    root = subject_root(subject)
+    return SUBJECT_ICONS.get(root, "📘") if root else "📘"
 
 
 def canonical_subject_key(text: str) -> str:
     """Приводит вольное написание предмета к одному из "корневых" ключей из
     ZOOM_BY_SUBJECT (та же логика, что уже надёжно работает для Zoom-ссылок,
     и учитывает варианты написания вроде "Квітництво"/"Квітівництво")."""
-    low = text.lower()
-    for key in ZOOM_BY_SUBJECT:
-        if key in low:
-            return key
-    return low
+    return subject_root(text) or _norm(text)
 
 
 def _classroom_configured() -> bool:
@@ -592,10 +623,13 @@ async def fetch_replacements():
 
     day_map: dict[int, tuple] = {}
     for row in group_rows:
-        subject = row["subject"] or "Вільна"
+        subject = row["subject"] or "Вільно"
         teacher = row["teacher"]
-        full_subject = f"{subject} — {teacher}" if teacher and "Вільн" not in subject else subject
-        link = find_zoom_for_subject(subject)
+        if is_free_lesson(subject):
+            full_subject, link = "Вільно", None   # единый вид, как в основном расписании
+        else:
+            full_subject = f"{subject} — {teacher}" if teacher else subject
+            link = find_zoom_for_subject(subject)
 
         # "3,4" -> применяем и к 3-й, и к 4-й паре
         for part in row["pair"].split(","):
@@ -630,6 +664,12 @@ def resolve_day_lessons(day_name, target_date):
             else:
                 subject = lines[1].replace("Під рискою: ", "")
         resolved.append((index, time_slot, subject, link))
+
+    def _start_minutes(item):
+        m = re.search(r"\((\d{1,2}):(\d{2})-", item[1])
+        return int(m.group(1)) * 60 + int(m.group(2)) if m else 10**6
+
+    resolved.sort(key=_start_minutes)  # сортировка устойчивая: порядок пар не ломается
     return resolved
 
 
@@ -647,7 +687,7 @@ def send_schedule_for_day(day_name, target_date):
     for index, time_slot, subject, link in lessons:
         icon = subject_icon(subject)
 
-        if link and "Вільно" not in subject and "Вільна" not in subject:
+        if link and not is_free_lesson(subject):
             response += f"🔹 **{time_slot}**\n   {icon} {subject}\n   🔗 [Підключитися до Zoom]({link})\n"
         else:
             response += f"🔹 **{time_slot}**\n   {icon} {subject}\n"
@@ -901,11 +941,13 @@ async def check_reminders():
             hh, mm = int(m.group(1)), int(m.group(2))
             if (hh, mm) != (target.hour, target.minute):
                 continue
-            if "Вільно" in subject or "Вільна" in subject:
+            if is_free_lesson(subject):
                 continue
 
             icon = subject_icon(subject)
-            text = f"{prefix} {index} пара:\n{icon} {subject}"
+            label = time_slot.split("(")[0].strip()          # «1 пара» или «Класний час»
+            head = f"{prefix} {label}:" if label.endswith("пара") else f"{prefix}:"
+            text = f"{head}\n{icon} {subject}"
             if link:
                 text += f"\n🔗 {link}"
 
