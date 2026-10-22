@@ -61,6 +61,11 @@ USERS: dict[str, dict] = {}
 # Кто подписан на напоминания за 5 минут до пары (user_id как строка)
 SUBSCRIBERS: set[str] = set()
 
+# GRADES_SEEN[id_сдачи] = оценка, о которой бот уже сообщил. None — ещё не
+# было ни одной проверки (первая проверка только запоминает текущие оценки,
+# чтобы не завалить тебя сообщениями про всё, что выставили раньше).
+GRADES_SEEN: dict[str, float] | None = None
+
 # Общая обёртка над содержимым бина в JSONBin — храним домашку, статистику
 # пользователей и подписки на напоминания вместе, чтобы не заводить много бинов.
 BIN_DATA: dict = {"homework": {}, "users": {}, "subscribers": []}
@@ -234,10 +239,7 @@ def _classroom_configured() -> bool:
     return bool(CLASSROOM_CLIENT_ID and CLASSROOM_CLIENT_SECRET and CLASSROOM_REFRESH_TOKEN)
 
 
-def _fetch_classroom_sync() -> list[dict]:
-    """Синхронная (блокирующая) часть — идёт в отдельном потоке. Собирает
-    свежие задания (coursework) по всем активным
-    курсам Google Classroom, к которым привязан авторизованный аккаунт."""
+def _classroom_service():
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
 
@@ -249,7 +251,14 @@ def _fetch_classroom_sync() -> list[dict]:
         token_uri="https://oauth2.googleapis.com/token",
         scopes=CLASSROOM_SCOPES,
     )
-    service = build("classroom", "v1", credentials=creds, cache_discovery=False)
+    return build("classroom", "v1", credentials=creds, cache_discovery=False)
+
+
+def _fetch_classroom_sync() -> list[dict]:
+    """Синхронная (блокирующая) часть — идёт в отдельном потоке. Собирает
+    свежие задания (coursework) по всем активным
+    курсам Google Classroom, к которым привязан авторизованный аккаунт."""
+    service = _classroom_service()
 
     courses = service.courses().list(courseStates=["ACTIVE"]).execute(num_retries=3).get("courses", [])
 
@@ -421,6 +430,137 @@ async def _send_long_text(message: Message, text: str):
         await message.answer(text[i:i + 4000], parse_mode="Markdown", disable_web_page_preview=True)
 
 
+def _paged(make_request, key: str) -> list:
+    """Забирает все страницы списка из Classroom API."""
+    items, token = [], None
+    while True:
+        resp = make_request(token).execute(num_retries=3)
+        items += resp.get(key, [])
+        token = resp.get("nextPageToken")
+        if not token:
+            return items
+
+
+def _fetch_grades_sync() -> list[dict]:
+    """Все выставленные и возвращённые оценки по активным курсам.
+    Ученик видит только assignedGrade (после того, как препод вернул работу)."""
+    service = _classroom_service()
+    courses = service.courses().list(courseStates=["ACTIVE"]).execute(num_retries=3).get("courses", [])
+
+    grades, failed = [], 0
+    for course in courses:
+        cid = course["id"]
+        try:
+            works = {
+                w["id"]: w
+                for w in _paged(
+                    lambda t: service.courses().courseWork().list(courseId=cid, pageSize=100, pageToken=t),
+                    "courseWork",
+                )
+            }
+            subs = _paged(
+                lambda t: service.courses().courseWork().studentSubmissions().list(
+                    courseId=cid, courseWorkId="-", userId="me", pageSize=100, pageToken=t
+                ),
+                "studentSubmissions",
+            )
+        except Exception as e:
+            # напр. курс, где аккаунт — преподаватель, а не ученик
+            failed += 1
+            logging.warning("Оцінки: курс %s пропущено: %s", course.get("name"), e)
+            continue
+
+        for s in subs:
+            if s.get("assignedGrade") is None:
+                continue
+            w = works.get(s.get("courseWorkId"), {})
+            grades.append({
+                "id": s["id"],
+                "course": course.get("name", "Без назви"),
+                "title": w.get("title", "Завдання"),
+                "grade": s["assignedGrade"],
+                "max": w.get("maxPoints"),
+                "update_time": s.get("updateTime") or "",
+                "link": s.get("alternateLink"),
+            })
+
+    if courses and failed == len(courses):
+        raise RuntimeError("Classroom: не вдалося отримати оцінки ні по одному курсу")
+
+    logging.info("Classroom: курсів %d, оцінок %d", len(courses), len(grades))
+    return grades
+
+
+def _grade_str(g: dict) -> str:
+    text = f"{g['grade']:g}"
+    if g.get("max"):
+        text += f"/{g['max']:g}"
+    return text
+
+
+async def _send_plain(message: Message, text: str):
+    # без parse_mode: назви завдань можуть містити * _ [ і ламати Markdown
+    for i in range(0, len(text), 4000):
+        await message.answer(text[i:i + 4000], disable_web_page_preview=True)
+
+
+async def check_new_grades():
+    """Раз в полчаса: если появилась новая (или изменённая) оценка — пишет
+    старосте в личку. Первая проверка только запоминает текущие оценки."""
+    global GRADES_SEEN
+    if not _classroom_configured() or not ADMIN_IDS:
+        return
+
+    try:
+        grades = await asyncio.to_thread(_fetch_grades_sync)
+    except Exception:
+        logging.exception("Не вдалося перевірити оцінки")
+        return
+
+    if GRADES_SEEN is None:
+        GRADES_SEEN = {g["id"]: g["grade"] for g in grades}
+        logging.info("Оцінки: запам'ятав %d поточних, далі пишу про нові", len(GRADES_SEEN))
+        await save_bin()
+        if JSONBIN_API_KEY and JSONBIN_BIN_ID:
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"📊 Відстеження оцінок увімкнено. Запам'ятав {len(GRADES_SEEN)} поточних, "
+                        "далі напишу, коли з'явиться нова.",
+                    )
+                except Exception:
+                    logging.exception("Не вдалося надіслати повідомлення %s", admin_id)
+        return
+
+    new = [g for g in grades if GRADES_SEEN.get(g["id"]) != g["grade"]]
+    if not new:
+        return
+
+    new.sort(key=lambda g: g["update_time"])
+    blocks = []
+    for g in new:
+        block = f"📊 {g['course']}\n{_strip_leading_date(g['title'])} — {_grade_str(g)}"
+        if g["link"]:
+            block += f"\n🔗 {g['link']}"
+        blocks.append(block)
+    text = ("🎉 Нова оцінка!\n\n" if len(new) == 1 else f"🎉 Нових оцінок: {len(new)}\n\n") + "\n\n".join(blocks)
+
+    delivered = False
+    for admin_id in ADMIN_IDS:
+        try:
+            for i in range(0, len(text), 4000):
+                await bot.send_message(admin_id, text[i:i + 4000], disable_web_page_preview=True)
+            delivered = True
+        except Exception:
+            logging.exception("Не вдалося надіслати оцінку %s", admin_id)
+
+    if delivered:  # якщо не вдалося нікому — спробуємо ще раз на наступній перевірці
+        for g in new:
+            GRADES_SEEN[g["id"]] = g["grade"]
+        await save_bin()
+
+
 def _jsonbin_headers():
     return {"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"}
 
@@ -439,7 +579,7 @@ def _save_bin_sync(data: dict) -> None:
 async def load_bin():
     """Подтягивает домашку и статистику пользователей из JSONBin при старте
     бота (после сна/редеплоя память бота пустая, а в JSONBin данные остались)."""
-    global BIN_DATA, HOMEWORK, USERS, SUBSCRIBERS
+    global BIN_DATA, HOMEWORK, USERS, SUBSCRIBERS, GRADES_SEEN
     if not JSONBIN_API_KEY or not JSONBIN_BIN_ID:
         logging.info("JSONBin не настроен — домашка, статистика и напоминания работать не будут (см. README).")
         return
@@ -448,6 +588,7 @@ async def load_bin():
         HOMEWORK = BIN_DATA.setdefault("homework", {})
         USERS = BIN_DATA.setdefault("users", {})
         SUBSCRIBERS = set(BIN_DATA.setdefault("subscribers", []))
+        GRADES_SEEN = BIN_DATA.get("grades_seen")  # None, если ещё не запоминали
         logging.info(
             "Дані з JSONBin завантажені: %d дат д/з, %d користувачів, %d підписок на нагадування",
             len(HOMEWORK), len(USERS), len(SUBSCRIBERS)
@@ -462,6 +603,8 @@ async def save_bin():
     BIN_DATA["homework"] = HOMEWORK
     BIN_DATA["users"] = USERS
     BIN_DATA["subscribers"] = list(SUBSCRIBERS)
+    if GRADES_SEEN is not None:
+        BIN_DATA["grades_seen"] = GRADES_SEEN
     try:
         await asyncio.to_thread(_save_bin_sync, BIN_DATA)
     except Exception:
@@ -824,9 +967,58 @@ CLASSROOM_MENU = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 
+def _classroom_menu_for(user_id: int) -> InlineKeyboardMarkup:
+    rows = list(CLASSROOM_MENU.inline_keyboard)
+    if user_id in ADMIN_IDS:
+        # токен Classroom привязан к аккаунту старосты — оценки личные, остальным не показываем
+        rows.append([InlineKeyboardButton(text="📊 Мої оцінки", callback_data="cls_grades")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(F.text == "🎓 Classroom")
 async def classroom_menu(message: Message):
-    await message.answer("Що показати з Classroom?", reply_markup=CLASSROOM_MENU)
+    await message.answer("Що показати з Classroom?", reply_markup=_classroom_menu_for(message.from_user.id))
+
+
+@dp.callback_query(F.data == "cls_grades")
+async def classroom_grades(callback: CallbackQuery):
+    await callback.answer()
+
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.message.answer("Оцінки доступні тільки старості.")
+        return
+    if not _classroom_configured():
+        await callback.message.answer(_classroom_not_configured_text())
+        return
+
+    await callback.message.answer("⏳ Завантажую оцінки...")
+    try:
+        grades = await asyncio.to_thread(_fetch_grades_sync)
+    except Exception:
+        logging.exception("Не вдалося отримати оцінки з Google Classroom")
+        await callback.message.answer(CLASSROOM_ERROR_TEXT)
+        return
+
+    if not grades:
+        await callback.message.answer(
+            "Виставлених оцінок поки немає. Оцінка з'являється тут після того, як викладач поверне роботу."
+        )
+        return
+
+    by_course: dict[str, list[dict]] = {}
+    for g in sorted(grades, key=lambda g: g["update_time"], reverse=True):
+        by_course.setdefault(g["course"], []).append(g)
+
+    lines = []
+    for course, items in by_course.items():
+        pcts = [g["grade"] / g["max"] * 100 for g in items if g.get("max")]
+        avg = f" (середній {sum(pcts) / len(pcts):.0f}%)" if pcts else ""
+        lines.append(f"📘 {course}{avg}")
+        for g in items[:8]:
+            lines.append(f"  • {_strip_leading_date(g['title'])} — {_grade_str(g)}")
+        lines.append("")
+
+    await _send_plain(callback.message, "\n".join(lines).strip())
 
 
 @dp.callback_query(F.data.startswith("cls_"))
@@ -977,6 +1169,7 @@ async def main():
     scheduler.add_job(fetch_replacements, 'cron', hour=17, minute=0)
     scheduler.add_job(save_bin, 'interval', minutes=15)
     scheduler.add_job(check_reminders, 'interval', minutes=1)
+    scheduler.add_job(check_new_grades, 'interval', minutes=30)
     scheduler.start()
     
     await fetch_replacements()
